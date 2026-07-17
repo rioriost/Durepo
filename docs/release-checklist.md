@@ -13,6 +13,7 @@ Release candidate date: 2026-07-17
 ## App Store Connect values
 
 - Version: `1.0.0`
+- Bundle ID: `st.rio.Durepo` (the exact identifier automatically registered by Xcode)
 - Category: Utilities
 - Support URL: <https://github.com/rioriost/Durepo/issues>
 - Privacy policy URL: <https://github.com/rioriost/Durepo/blob/main/PRIVACY.md>
