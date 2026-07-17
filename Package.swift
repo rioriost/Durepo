@@ -12,7 +12,8 @@ let package = Package(
     targets: [
         .target(
             name: "DurepoCore",
-            path: "Sources/DurepoCore"
+            path: "Sources/DurepoCore",
+            resources: [.process("Resources")]
         ),
         .executableTarget(
             name: "DurepoSmoke",

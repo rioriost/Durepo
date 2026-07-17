@@ -50,3 +50,13 @@
 "%lld files • %@" = "%lld files • %@";
 "Durepo Error" = "Durepo Error";
 "OK" = "OK";
+"Invalid repository: %@" = "Invalid repository: %@";
+"Backup storage must not be inside the protected repository." = "Backup storage must not be inside the protected repository.";
+"A repository inside Durepo storage cannot be protected." = "A repository inside Durepo storage cannot be protected.";
+"Unsupported file type: %@" = "Unsupported file type: %@";
+"File changed while it was being copied: %@" = "File changed while it was being copied: %@";
+"Unsafe path in snapshot manifest: %@" = "Unsafe path in snapshot manifest: %@";
+"Snapshot object is missing: %@" = "Snapshot object is missing: %@";
+"Restore destination already exists: %@" = "Restore destination already exists: %@";
+"Access to the selected folder was denied." = "Access to the selected folder was denied.";
+"Unsupported snapshot format: %lld" = "Unsupported snapshot format: %lld";

@@ -31,6 +31,7 @@ private actor AgentCoordinator {
     private let store: SnapshotStore
     private var sessions: [UUID: RepositorySession] = [:]
     private var debounceTasks: [UUID: Task<Void, Never>] = [:]
+    private var burstStartedAt: [UUID: ContinuousClock.Instant] = [:]
     private var snapshotting: Set<UUID> = []
 
     init(storageURL: URL) {
@@ -48,6 +49,7 @@ private actor AgentCoordinator {
         for id in sessions.keys where !activeIDs.contains(id) {
             sessions.removeValue(forKey: id)
             debounceTasks.removeValue(forKey: id)?.cancel()
+            burstStartedAt.removeValue(forKey: id)
         }
 
         for record in records where sessions[record.id] == nil {
@@ -75,15 +77,33 @@ private actor AgentCoordinator {
     }
 
     private func scheduleSnapshot(for repositoryID: UUID) {
+        let clock = ContinuousClock()
+        let now = clock.now
+        if let startedAt = burstStartedAt[repositoryID],
+           startedAt.duration(to: now) >= .seconds(10) {
+            debounceTasks.removeValue(forKey: repositoryID)?.cancel()
+            burstStartedAt.removeValue(forKey: repositoryID)
+            Task { [weak self] in await self?.createSnapshot(for: repositoryID) }
+            return
+        }
+        if burstStartedAt[repositoryID] == nil {
+            burstStartedAt[repositoryID] = now
+        }
         debounceTasks[repositoryID]?.cancel()
         debounceTasks[repositoryID] = Task { [weak self] in
             do {
                 try await Task.sleep(for: .seconds(1))
-                await self?.createSnapshot(for: repositoryID)
+                await self?.finishDebouncedSnapshot(for: repositoryID)
             } catch {
                 // A newer event superseded this debounce task.
             }
         }
+    }
+
+    private func finishDebouncedSnapshot(for repositoryID: UUID) async {
+        debounceTasks.removeValue(forKey: repositoryID)
+        burstStartedAt.removeValue(forKey: repositoryID)
+        await createSnapshot(for: repositoryID)
     }
 
     private func createSnapshot(for repositoryID: UUID) async {

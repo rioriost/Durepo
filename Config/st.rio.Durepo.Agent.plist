@@ -6,6 +6,8 @@
     <string>st.rio.Durepo.Agent</string>
     <key>BundleProgram</key>
     <string>Contents/Resources/DurepoAgent</string>
+    <key>RunAtLoad</key>
+    <true/>
     <key>KeepAlive</key>
     <dict>
         <key>SuccessfulExit</key>

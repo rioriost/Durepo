@@ -50,3 +50,13 @@
 "%lld files • %@" = "%lldファイル • %@";
 "Durepo Error" = "Durepoエラー";
 "OK" = "OK";
+"Invalid repository: %@" = "無効なリポジトリです：%@";
+"Backup storage must not be inside the protected repository." = "バックアップ保存先を保護対象リポジトリ内に置くことはできません。";
+"A repository inside Durepo storage cannot be protected." = "Durepoの保存領域内にあるリポジトリは保護できません。";
+"Unsupported file type: %@" = "対応していないファイル形式です：%@";
+"File changed while it was being copied: %@" = "コピー中にファイルが変更されました：%@";
+"Unsafe path in snapshot manifest: %@" = "スナップショットのマニフェストに安全でないパスがあります：%@";
+"Snapshot object is missing: %@" = "スナップショットのオブジェクトがありません：%@";
+"Restore destination already exists: %@" = "復元先がすでに存在します：%@";
+"Access to the selected folder was denied." = "選択したフォルダへのアクセスが拒否されました。";
+"Unsupported snapshot format: %lld" = "対応していないスナップショット形式です：%lld";

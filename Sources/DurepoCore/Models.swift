@@ -134,16 +134,21 @@ public enum DurepoError: Error, LocalizedError, Sendable {
 
     public var errorDescription: String? {
         switch self {
-        case .invalidRepository(let path): "Invalid repository: \(path)"
-        case .storageInsideRepository: "Backup storage must not be inside the protected repository."
-        case .repositoryInsideStorage: "A repository inside Durepo storage cannot be protected."
-        case .unsupportedFile(let path): "Unsupported file type: \(path)"
-        case .fileChangedDuringRead(let path): "File changed while it was being copied: \(path)"
-        case .unsafeManifestPath(let path): "Unsafe path in snapshot manifest: \(path)"
-        case .missingObject(let hash): "Snapshot object is missing: \(hash)"
-        case .destinationExists(let path): "Restore destination already exists: \(path)"
-        case .bookmarkAccessDenied: "Access to the selected folder was denied."
-        case .unsupportedFormat(let version): "Unsupported snapshot format: \(version)"
+        case .invalidRepository(let path): localized("Invalid repository: %@", path)
+        case .storageInsideRepository: localized("Backup storage must not be inside the protected repository.")
+        case .repositoryInsideStorage: localized("A repository inside Durepo storage cannot be protected.")
+        case .unsupportedFile(let path): localized("Unsupported file type: %@", path)
+        case .fileChangedDuringRead(let path): localized("File changed while it was being copied: %@", path)
+        case .unsafeManifestPath(let path): localized("Unsafe path in snapshot manifest: %@", path)
+        case .missingObject(let hash): localized("Snapshot object is missing: %@", hash)
+        case .destinationExists(let path): localized("Restore destination already exists: %@", path)
+        case .bookmarkAccessDenied: localized("Access to the selected folder was denied.")
+        case .unsupportedFormat(let version): localized("Unsupported snapshot format: %lld", Int64(version))
         }
+    }
+
+    private func localized(_ key: String, _ arguments: CVarArg...) -> String {
+        let format = NSLocalizedString(key, bundle: .main, comment: "Durepo error")
+        return String(format: format, locale: .current, arguments: arguments)
     }
 }

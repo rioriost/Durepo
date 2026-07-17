@@ -11,6 +11,7 @@ The current `0.1.0` implementation is a smoke-testable foundation, not a product
 - integrity verification and restore to a new directory;
 - an FSEvents LaunchAgent embedded and managed with `SMAppService`;
 - App Sandbox, App Group, Hardened Runtime, App Store export, and Developer ID notarization configuration.
+- privacy manifests declaring the required reasons for file metadata and elapsed-time APIs.
 
 See [the reviewed implementation plan](docs/plan.md) and [the multi-angle review](docs/plan-review.md) for the threat model and known gaps.
 
