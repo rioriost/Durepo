@@ -5,6 +5,9 @@
 "Protected repositories" = "Protected repositories";
 "Agent" = "Agent";
 "Background protection" = "Background protection";
+"Launch at Login" = "Launch at Login";
+"Storage:" = "Storage:";
+"Durepo Settings" = "Durepo Settings";
 "The background agent only accesses folders you explicitly choose." = "The background agent only accesses folders you explicitly choose.";
 "Disable Agent" = "Disable Agent";
 "Enable Agent" = "Enable Agent";

@@ -1,5 +1,4 @@
 import DurepoCore
-import ServiceManagement
 import SwiftUI
 
 struct ContentView: View {
@@ -59,31 +58,6 @@ private struct DashboardView: View {
                 HStack(spacing: 16) {
                     MetricCard(title: "Protected repositories", value: "\(model.repositories.count)", symbol: "folder.badge.gearshape")
                     MetricCard(title: "Snapshots", value: "\(model.snapshots.count)", symbol: "clock.arrow.circlepath")
-                    MetricCard(
-                        title: "Agent",
-                        value: model.agentStatus.localizedTitle,
-                        symbol: model.agentStatus == .enabled ? "checkmark.shield" : "exclamationmark.shield"
-                    )
-                }
-
-                GroupBox("Background protection") {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(model.agentStatus.localizedDescription)
-                            Text("The background agent only accesses folders you explicitly choose.")
-                                .foregroundStyle(.secondary)
-                                .font(.caption)
-                        }
-                        Spacer()
-                        if model.agentStatus == .enabled {
-                            Button("Disable Agent", role: .destructive) { model.unregisterAgent() }
-                        } else {
-                            Button("Enable Agent") { model.registerAgent() }
-                                .buttonStyle(.borderedProminent)
-                        }
-                        Button("Login Item Settings") { model.openLoginItemSettings() }
-                    }
-                    .padding(8)
                 }
 
                 GroupBox("Recent snapshots") {
@@ -230,44 +204,36 @@ struct SettingsView: View {
     @Bindable var model: AppModel
 
     var body: some View {
-        Form {
-            Section("Background agent") {
-                LabeledContent("Status", value: model.agentStatus.localizedTitle)
-                HStack {
-                    Button("Enable Agent") { model.registerAgent() }
-                    Button("Disable Agent", role: .destructive) { model.unregisterAgent() }
-                    Button("Login Item Settings") { model.openLoginItemSettings() }
-                }
-            }
-            Section("Storage") {
-                Text(model.storagePath)
-                    .font(.caption.monospaced())
-                    .textSelection(.enabled)
-            }
-            Section("Privacy") {
-                Text("Durepo processes repository data locally and does not transmit file contents.")
-            }
-        }
-    }
-}
+        VStack(alignment: .leading, spacing: 16) {
+            Toggle(
+                "Background protection",
+                isOn: Binding(
+                    get: { model.isAgentEnabled },
+                    set: { model.setAgentEnabled($0) }
+                )
+            )
+            .toggleStyle(.switch)
 
-private extension SMAppService.Status {
-    var localizedTitle: String {
-        switch self {
-        case .enabled: String(localized: "Enabled")
-        case .requiresApproval: String(localized: "Approval Required")
-        case .notFound: String(localized: "Not Found")
-        default: String(localized: "Disabled")
-        }
-    }
+            Toggle(
+                "Launch at Login",
+                isOn: Binding(
+                    get: { model.launchesAtLogin },
+                    set: { model.setLaunchesAtLogin($0) }
+                )
+            )
+            .toggleStyle(.checkbox)
+            .accessibilityLabel(Text("Launch at Login"))
 
-    var localizedDescription: String {
-        switch self {
-        case .enabled: String(localized: "Durepo is monitoring in the background.")
-        case .requiresApproval: String(localized: "Allow Durepo in System Settings > General > Login Items.")
-        case .notFound: String(localized: "The embedded background agent could not be found.")
-        default: String(localized: "Enable the agent to keep monitoring after the app quits.")
+            Divider()
+
+            HStack {
+                Text("Storage:")
+                TextField("", text: .constant(model.storagePath))
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(true)
+            }
         }
+        .navigationTitle("Durepo Settings")
     }
 }
 

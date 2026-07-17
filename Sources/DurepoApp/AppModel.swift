@@ -27,6 +27,7 @@ final class AppModel {
     var progressDescription = ""
     var alert: AppAlert?
     var agentStatus = SMAppService.Status.notRegistered
+    var loginItemStatus = SMAppService.Status.notRegistered
 
     private let storageURL: URL
     private let registry: RepositoryRegistry
@@ -44,7 +45,7 @@ final class AppModel {
         storageURL = resolvedStorage
         registry = RepositoryRegistry(storageURL: resolvedStorage)
         store = SnapshotStore(storageURL: resolvedStorage)
-        refreshAgentStatus()
+        refreshServiceStatuses()
     }
 
     var storagePath: String { storageURL.path }
@@ -67,7 +68,7 @@ final class AppModel {
                 if latestSnapshots.map(\.id) != snapshots.map(\.id) {
                     snapshots = latestSnapshots
                 }
-                refreshAgentStatus()
+                refreshServiceStatuses()
             } catch is CancellationError {
                 return
             } catch {
@@ -85,7 +86,7 @@ final class AppModel {
             if selectedRepositoryID == nil {
                 selectedRepositoryID = repositories.first?.id
             }
-            refreshAgentStatus()
+            refreshServiceStatuses()
             scheduleAgentHandoffCleanup()
         } catch {
             present(error)
@@ -181,36 +182,53 @@ final class AppModel {
         }
     }
 
-    func registerAgent() {
+    var isAgentEnabled: Bool {
+        agentStatus == .enabled
+    }
+
+    var launchesAtLogin: Bool {
+        loginItemStatus == .enabled
+    }
+
+    func setAgentEnabled(_ isEnabled: Bool) {
         do {
-            try agentService.register()
-            refreshAgentStatus()
+            if isEnabled {
+                try agentService.register()
+            } else {
+                try agentService.unregister()
+            }
+            refreshServiceStatuses()
         } catch {
             present(error)
-            refreshAgentStatus()
+            refreshServiceStatuses()
         }
     }
 
-    func unregisterAgent() {
+    func setLaunchesAtLogin(_ isEnabled: Bool) {
         do {
-            try agentService.unregister()
-            refreshAgentStatus()
+            if isEnabled {
+                try loginItemService.register()
+            } else {
+                try loginItemService.unregister()
+            }
+            refreshServiceStatuses()
         } catch {
             present(error)
-            refreshAgentStatus()
+            refreshServiceStatuses()
         }
     }
 
-    func openLoginItemSettings() {
-        SMAppService.openSystemSettingsLoginItems()
-    }
-
-    func refreshAgentStatus() {
+    func refreshServiceStatuses() {
         agentStatus = agentService.status
+        loginItemStatus = loginItemService.status
     }
 
     private var agentService: SMAppService {
         .agent(plistName: DurepoConstants.agentPlistName)
+    }
+
+    private var loginItemService: SMAppService {
+        .mainApp
     }
 
     private func snapshot(_ record: RepositoryRecord, reason: SnapshotReason) async throws {

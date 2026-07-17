@@ -21,8 +21,8 @@ struct DurepoApp: App {
 
         Settings {
             SettingsView(model: model)
-                .frame(width: 520)
-                .padding()
+                .frame(width: 460)
+                .padding(20)
         }
     }
 }
