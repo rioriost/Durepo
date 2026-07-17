@@ -9,7 +9,7 @@
 
 - 最低対応は **macOS 26 Tahoe / Apple Silicon** とする。macOS 27 はベータのため必須にせず、Xcode 27正式版で再検証する。
 - Mac App Store配布を前提とし、GUIとLaunchAgentの双方で **App Sandboxを必須** とする。Sandbox無効版は製品構成にしない。
-- 監視対象は `NSOpenPanel` でユーザーが明示選択し、read-writeのsecurity-scoped bookmarkを保存する。GUIとAgentはApp GroupでブックマークとCASを共有する。
+- 監視対象は `NSOpenPanel` でユーザーが明示選択し、GUIとAgentがそれぞれ自分で作成したread-writeのsecurity-scoped bookmarkを保存する。GUIからAgentへは通常のbookmarkで一時的にアクセス権を引き渡し、app-scoped bookmark自体はプロセス間で流用しない。App Groupでは登録情報、CAS、manifestを共有する。
 - Agent実行ファイルはアプリ内の `Contents/Resources`、launchd plistは `Contents/Library/LaunchAgents` に置き、`BundleProgram` と `SMAppService.agent(plistName:)` で登録する。
 - 保存先はApp Group container配下を既定とする。外付け保存先は別途ユーザー選択とbookmarkが必要であり、監視対象配下への保存は禁止する。
 - Durepoは同一ユーザー権限を完全に敵対者とみなす改ざん耐性バックアップではない。Full Disk Accessを持つプロセスやユーザー自身はDurepoデータも削除し得る。1.0では「偶発的誤操作からの高速復旧」を保証範囲とし、外付け/リモート複製を強い保護の将来要件とする。
@@ -802,7 +802,7 @@ MVPではローカルストレージを優先する。
 
 Sandboxを有効にする場合、GUIから選択された監視対象ディレクトリについてSecurity-Scoped Bookmarkを保存する。
 
-LaunchAgentが同じブックマークを利用できる構成を検討する。
+app-scoped bookmarkは作成元アプリの署名IDに結び付くため、LaunchAgentがGUIのbookmarkをそのまま解決してはならない。GUIが稼働中に通常のbookmark（作成optionsは空）をApp Group経由で引き渡し、Agentはそれを解決して自分用のsecurity-scoped bookmarkを作成・保存する。
 
 ただし、LaunchAgentとSandboxの組み合わせは実装上の制約が多いため、初期段階では以下の選択肢を比較する。
 
@@ -811,7 +811,7 @@ LaunchAgentが同じブックマークを利用できる構成を検討する。
 - App Sandboxを有効にする（Mac App Store必須要件）
 - ユーザー選択read-write entitlementとSecurity-Scoped Bookmarkを利用する
 - GUIとLaunchAgentの双方をSandbox化する
-- App Groupでbookmark、設定、CAS、manifestを共有する
+- App Groupで通常bookmarkの短時間handoff、設定、CAS、manifestを共有する。永続security-scoped bookmarkはGUI用とAgent用を分離する
 - bookmark解決後は処理期間だけ`startAccessingSecurityScopedResource()`し、必ず対応するstopを行う
 
 ---

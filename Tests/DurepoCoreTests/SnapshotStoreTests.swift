@@ -4,6 +4,20 @@ import Testing
 
 @Suite("Snapshot store")
 struct SnapshotStoreTests {
+    @Test("Repository records remain compatible with pre-agent-bookmark data")
+    func legacyRepositoryRecordDecoding() throws {
+        let json = #"{"id":"3271F239-D6F3-474E-8C77-E9DAFC5EDF67","displayName":"m2horizon","bookmark":"AQID","addedAt":"2026-07-17T03:02:29Z","isEnabled":true}"#
+        let record = try JSONDecoder.durepo.decode(
+            RepositoryRecord.self,
+            from: Data(json.utf8)
+        )
+
+        #expect(record.displayName == "m2horizon")
+        #expect(record.bookmark == Data([1, 2, 3]))
+        #expect(record.agentBookmark == nil)
+        #expect(record.handoffBookmark == nil)
+    }
+
     @Test("Snapshots and restores worktree, .git, and symlinks")
     func roundTrip() async throws {
         try await withFixture { fixture in

@@ -10,6 +10,8 @@ public struct RepositoryRecord: Codable, Identifiable, Hashable, Sendable {
     public let id: UUID
     public var displayName: String
     public var bookmark: Data
+    public var agentBookmark: Data?
+    public var handoffBookmark: Data?
     public var addedAt: Date
     public var isEnabled: Bool
 
@@ -17,12 +19,16 @@ public struct RepositoryRecord: Codable, Identifiable, Hashable, Sendable {
         id: UUID = UUID(),
         displayName: String,
         bookmark: Data,
+        agentBookmark: Data? = nil,
+        handoffBookmark: Data? = nil,
         addedAt: Date = .now,
         isEnabled: Bool = true
     ) {
         self.id = id
         self.displayName = displayName
         self.bookmark = bookmark
+        self.agentBookmark = agentBookmark
+        self.handoffBookmark = handoffBookmark
         self.addedAt = addedAt
         self.isEnabled = isEnabled
     }

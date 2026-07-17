@@ -14,7 +14,7 @@ struct DurepoAgentMain {
             logger.info("Durepo agent started")
 
             while !Task.isCancelled {
-                try await Task.sleep(for: .seconds(30))
+                try await Task.sleep(for: .seconds(5))
                 try await coordinator.refreshRegistrations()
             }
         } catch is CancellationError {
@@ -41,10 +41,10 @@ private actor AgentCoordinator {
 
     func refreshRegistrations() async throws {
         let records = try await registry.records().filter(\.isEnabled)
-        updateSessions(records)
+        await updateSessions(records)
     }
 
-    private func updateSessions(_ records: [RepositoryRecord]) {
+    private func updateSessions(_ records: [RepositoryRecord]) async {
         let activeIDs = Set(records.map(\.id))
         for id in sessions.keys where !activeIDs.contains(id) {
             sessions.removeValue(forKey: id)
@@ -54,26 +54,59 @@ private actor AgentCoordinator {
 
         for record in records where sessions[record.id] == nil {
             do {
-                var stale = false
-                let url = try URL(
-                    resolvingBookmarkData: record.bookmark,
-                    options: [.withSecurityScope],
-                    relativeTo: nil,
-                    bookmarkDataIsStale: &stale
-                )
-                guard url.startAccessingSecurityScopedResource() else {
-                    throw DurepoError.bookmarkAccessDenied
-                }
+                let (agentRecord, url) = try await resolveRepository(record)
                 let watcher = try FSEventWatcher(url: url) { [weak self] in
                     guard let self else { return }
                     Task { await self.scheduleSnapshot(for: record.id) }
                 }
-                sessions[record.id] = RepositorySession(record: record, url: url, watcher: watcher)
-                logger.info("Monitoring \(record.displayName, privacy: .private)")
+                sessions[record.id] = RepositorySession(record: agentRecord, url: url, watcher: watcher)
+                logger.info("Monitoring \(agentRecord.displayName, privacy: .private)")
             } catch {
                 logger.error("Unable to monitor \(record.displayName, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
         }
+    }
+
+    private func resolveRepository(_ record: RepositoryRecord) async throws -> (RepositoryRecord, URL) {
+        var agentRecord = record
+        let persistentBookmark: Data
+
+        if let bookmark = record.agentBookmark {
+            persistentBookmark = bookmark
+        } else {
+            guard let handoffBookmark = record.handoffBookmark else {
+                throw DurepoError.bookmarkAccessDenied
+            }
+            var handoffIsStale = false
+            let handoffURL = try URL(
+                resolvingBookmarkData: handoffBookmark,
+                options: [],
+                relativeTo: nil,
+                bookmarkDataIsStale: &handoffIsStale
+            )
+            defer { handoffURL.stopAccessingSecurityScopedResource() }
+
+            persistentBookmark = try handoffURL.bookmarkData(
+                options: [.withSecurityScope],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            agentRecord.agentBookmark = persistentBookmark
+            agentRecord.handoffBookmark = nil
+            try await registry.update(agentRecord)
+        }
+
+        var persistentIsStale = false
+        let url = try URL(
+            resolvingBookmarkData: persistentBookmark,
+            options: [.withSecurityScope],
+            relativeTo: nil,
+            bookmarkDataIsStale: &persistentIsStale
+        )
+        guard url.startAccessingSecurityScopedResource() else {
+            throw DurepoError.bookmarkAccessDenied
+        }
+        return (agentRecord, url)
     }
 
     private func scheduleSnapshot(for repositoryID: UUID) {

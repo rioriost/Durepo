@@ -31,6 +31,7 @@ final class AppModel {
     private let storageURL: URL
     private let registry: RepositoryRegistry
     private let store: SnapshotStore
+    private var pendingAgentHandoffURLs: [UUID: URL] = [:]
 
     init() {
         let resolvedStorage: URL
@@ -57,14 +58,35 @@ final class AppModel {
         return snapshots.filter { $0.repositoryID == selectedRepositoryID }
     }
 
+    func run() async {
+        await load()
+        while !Task.isCancelled {
+            do {
+                try await Task.sleep(for: .seconds(3))
+                let latestSnapshots = try await store.manifests()
+                if latestSnapshots.map(\.id) != snapshots.map(\.id) {
+                    snapshots = latestSnapshots
+                }
+                refreshAgentStatus()
+            } catch is CancellationError {
+                return
+            } catch {
+                // A later refresh retries transient cross-process I/O failures.
+            }
+        }
+    }
+
     func load() async {
         do {
-            repositories = try await registry.records().sorted { $0.displayName < $1.displayName }
+            var loadedRepositories = try await registry.records()
+            loadedRepositories = try await prepareAgentHandoffs(for: loadedRepositories)
+            repositories = loadedRepositories.sorted { $0.displayName < $1.displayName }
             snapshots = try await store.manifests()
             if selectedRepositoryID == nil {
                 selectedRepositoryID = repositories.first?.id
             }
             refreshAgentStatus()
+            scheduleAgentHandoffCleanup()
         } catch {
             present(error)
         }
@@ -86,7 +108,16 @@ final class AppModel {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
-            let record = RepositoryRecord(displayName: url.lastPathComponent, bookmark: bookmark)
+            let handoffBookmark = try url.bookmarkData(
+                options: [],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            let record = RepositoryRecord(
+                displayName: url.lastPathComponent,
+                bookmark: bookmark,
+                handoffBookmark: handoffBookmark
+            )
             try await registry.add(record)
             repositories.append(record)
             repositories.sort { $0.displayName < $1.displayName }
@@ -216,6 +247,57 @@ final class AppModel {
             }
         )
         snapshots.insert(manifest, at: 0)
+    }
+
+    private func prepareAgentHandoffs(for records: [RepositoryRecord]) async throws -> [RepositoryRecord] {
+        var prepared = records
+        for index in prepared.indices where prepared[index].agentBookmark == nil {
+            var record = prepared[index]
+            var stale = false
+            let url = try URL(
+                resolvingBookmarkData: record.bookmark,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            )
+            guard url.startAccessingSecurityScopedResource() else {
+                throw DurepoError.bookmarkAccessDenied
+            }
+            do {
+                record.handoffBookmark = try url.bookmarkData(
+                    options: [],
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                )
+                try await registry.update(record)
+                pendingAgentHandoffURLs[record.id] = url
+                prepared[index] = record
+            } catch {
+                url.stopAccessingSecurityScopedResource()
+                throw error
+            }
+        }
+        return prepared
+    }
+
+    private func scheduleAgentHandoffCleanup() {
+        guard !pendingAgentHandoffURLs.isEmpty else { return }
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            await self?.releaseCompletedAgentHandoffs()
+        }
+    }
+
+    private func releaseCompletedAgentHandoffs() async {
+        guard let records = try? await registry.records() else {
+            scheduleAgentHandoffCleanup()
+            return
+        }
+        let completedIDs = Set(records.compactMap { $0.agentBookmark == nil ? nil : $0.id })
+        for id in completedIDs {
+            pendingAgentHandoffURLs.removeValue(forKey: id)?.stopAccessingSecurityScopedResource()
+        }
+        scheduleAgentHandoffCleanup()
     }
 
     private func present(_ error: Error) {

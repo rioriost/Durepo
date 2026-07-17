@@ -8,7 +8,7 @@ struct DurepoApp: App {
         WindowGroup {
             ContentView(model: model)
                 .frame(minWidth: 860, minHeight: 560)
-                .task { await model.load() }
+                .task { await model.run() }
                 .alert(item: $model.alert) { alert in
                     Alert(
                         title: Text(alert.title),

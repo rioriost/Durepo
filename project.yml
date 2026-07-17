@@ -50,6 +50,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: st.rio.Durepo.Agent
         PRODUCT_NAME: DurepoAgent
+        INFOPLIST_FILE: "$(SRCROOT)/Config/DurepoAgent-Info.plist"
+        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
         CODE_SIGN_ENTITLEMENTS: "$(SRCROOT)/Config/DurepoAgent.entitlements"
         ENABLE_APP_SANDBOX: YES
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @loader_path/../Frameworks"
