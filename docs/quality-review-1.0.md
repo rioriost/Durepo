@@ -2,7 +2,7 @@
 
 Review date: 2026-07-17
 
-Verdict: release candidate approved; no open code-level P0/P1 issue found.
+Verdict: build 1 withdrawn after TestFlight acceptance testing; build 2 approved as the replacement release candidate after remediation and regression testing.
 
 ## Scope and threat model
 
@@ -20,7 +20,7 @@ Durepo 1.0.0 is suitable for rapid local recovery after an AI agent or developer
 
 ## Correctness and recovery review
 
-The automated suite contains 35 tests and covers:
+The automated suite contains 36 tests and covers:
 
 - `.git`, uncommitted files, symlinks, Git locks, hard links, sparse files, xattrs, and ACLs;
 - SHA-256 verification, deduplication, APFS clone independence, memory/streaming fallback, and corrupt-object detection;
@@ -28,8 +28,15 @@ The automated suite contains 35 tests and covers:
 - destructive-change protection, retention pause, repository-unavailable alerts, count retention, capacity retention, and GC;
 - paginated changes, paginated full-snapshot browsing, selective directory restore, and rollback-safe in-place restore;
 - exclusion syntax, rule persistence, optimizer behavior, and full-scan invalidation.
+- exclusion and non-fatal handling of macOS-owned extended attributes under App Sandbox.
 
 `swift test`, the CLI smoke test, Xcode Release analysis with warnings treated as errors, signed Debug build verification, Release archive, and App Store package export all passed. The exported package uses Cloud Managed Apple Distribution, the Store provisioning profile for `st.rio.Durepo`, and the expected sandbox/App Group entitlements for both executables.
+
+## TestFlight build 1 remediation
+
+TestFlight acceptance testing found that every snapshot failed with `EPERM` after `clonefile` succeeded. A sandboxed reproduction isolated the failure to `removexattr("com.apple.quarantine")`: macOS adds this system-owned attribute to data cloned or copied by the sandboxed process and intentionally rejects its removal. Durepo incorrectly treated that expected denial as a fatal snapshot error.
+
+Build 2 excludes `com.apple.quarantine`, `com.apple.provenance`, and `com.apple.macl` from repository metadata and tolerates `EPERM`, `EACCES`, and unsupported-operation results only while removing such incidental attributes. Data hashing, content verification, user xattrs, ACLs, and permission errors from source reads remain strict. Restore strips all removable incidental metadata before applying the recorded repository metadata. The exact Sandbox/App Group syscall sequence, all 36 Xcode tests, and the CLI smoke test pass after the change.
 
 ## Performance review
 
@@ -46,7 +53,7 @@ The automated suite contains 35 tests and covers:
 - macOS 27 beta-only APIs are not in the required path; Swift System `Stat` and Xcode 27 executor profiling remain later compatibility work.
 - The bundle contains all AppIcon asset sizes and a 1024px master, Privacy Manifest, English/Japanese strings, embedded Agent, and LaunchAgent plist.
 - Privacy Manifest declares file metadata (`3B52.1`, `C617.1`), elapsed time (`35F9.1`), and sufficient-disk-space checking (`E174.1`).
-- The App Store package is version `1.0.0` build `1`; support and privacy URLs are documented in the release checklist.
+- The replacement App Store package is version `1.0.0` build `2`; support and privacy URLs are documented in the release checklist.
 
 ## Remaining release operations
 

@@ -61,6 +61,12 @@ public actor SnapshotRestorer {
                         hardLinkTargets[group] = (hash, target)
                     }
                 }
+                // clonefile can propagate system-owned attributes that App Sandbox is
+                // intentionally not permitted to remove. Strip everything removable;
+                // FileMetadata tolerates the protected macOS attributes and never
+                // records or reapplies them as repository metadata.
+                try FileMetadata.removeExtendedAttributes(at: target)
+                try FileMetadata.removeACL(at: target)
                 try applyMetadata(entry, to: target)
             }
 

@@ -2,7 +2,22 @@ import Darwin
 import Foundation
 
 enum FileMetadata {
-    private static let excludedAttributeNames: Set<String> = ["com.apple.provenance"]
+    // macOS owns these attributes. Sandboxed processes may be allowed to list them but
+    // denied permission to remove or reapply them (notably com.apple.quarantine on a
+    // clone created by a TestFlight build). They are not repository metadata.
+    private static let excludedAttributeNames: Set<String> = [
+        "com.apple.macl",
+        "com.apple.provenance",
+        "com.apple.quarantine",
+    ]
+
+    static func shouldCaptureExtendedAttribute(named name: String) -> Bool {
+        !excludedAttributeNames.contains(name)
+    }
+
+    static func shouldIgnoreExtendedAttributeRemovalError(_ code: Int32) -> Bool {
+        [ENOATTR, ENOTSUP, EPERM, EACCES].contains(code)
+    }
 
     static func extendedAttributes(at url: URL, noFollow: Bool) throws -> [SnapshotExtendedAttribute]? {
         let options = noFollow ? XATTR_NOFOLLOW : 0
@@ -20,7 +35,7 @@ enum FileMetadata {
         while start < names.count {
             guard let end = names[start...].firstIndex(of: 0), end > start else { break }
             let name = String(decoding: names[start..<end].map(UInt8.init(bitPattern:)), as: UTF8.self)
-            if excludedAttributeNames.contains(name) {
+            if !shouldCaptureExtendedAttribute(named: name) {
                 start = end + 1
                 continue
             }
@@ -54,7 +69,7 @@ enum FileMetadata {
         while start < names.count {
             guard let end = names[start...].firstIndex(of: 0), end > start else { break }
             let name = String(decoding: names[start..<end].map(UInt8.init(bitPattern:)), as: UTF8.self)
-            if !excludedAttributeNames.contains(name) {
+            if shouldCaptureExtendedAttribute(named: name) {
                 let valueLength = fgetxattr(fileDescriptor, name, nil, 0, 0, 0)
                 if valueLength >= 0 {
                     var data = Data(count: valueLength)
@@ -119,8 +134,11 @@ enum FileMetadata {
         while start < names.count {
             guard let end = names[start...].firstIndex(of: 0), end > start else { break }
             let name = String(decoding: names[start..<end].map(UInt8.init(bitPattern:)), as: UTF8.self)
-            if removexattr(url.path, name, 0) != 0, errno != ENOATTR {
-                throw posixError()
+            if removexattr(url.path, name, 0) != 0 {
+                let code = errno
+                if !shouldIgnoreExtendedAttributeRemovalError(code) {
+                    throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+                }
             }
             start = end + 1
         }

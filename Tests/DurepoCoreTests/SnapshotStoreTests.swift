@@ -790,6 +790,17 @@ struct SnapshotStoreTests {
         }
     }
 
+    @Test("System-managed extended attributes are not snapshot metadata")
+    func systemManagedExtendedAttributesAreExcluded() {
+        #expect(!FileMetadata.shouldCaptureExtendedAttribute(named: "com.apple.macl"))
+        #expect(!FileMetadata.shouldCaptureExtendedAttribute(named: "com.apple.provenance"))
+        #expect(!FileMetadata.shouldCaptureExtendedAttribute(named: "com.apple.quarantine"))
+        #expect(FileMetadata.shouldCaptureExtendedAttribute(named: "com.example.durepo-test"))
+        #expect(FileMetadata.shouldIgnoreExtendedAttributeRemovalError(EPERM))
+        #expect(FileMetadata.shouldIgnoreExtendedAttributeRemovalError(EACCES))
+        #expect(!FileMetadata.shouldIgnoreExtendedAttributeRemovalError(EIO))
+    }
+
     @Test("Integrity diagnostics find orphan objects and garbage collection reclaims them")
     func integrityAndGarbageCollection() async throws {
         try await withFixture { fixture in
