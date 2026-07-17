@@ -114,6 +114,9 @@ final class AppModel {
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         do {
+            let didAccess = url.startAccessingSecurityScopedResource()
+            guard didAccess else { throw DurepoError.bookmarkAccessDenied }
+            defer { url.stopAccessingSecurityScopedResource() }
             let bookmark = try url.bookmarkData(
                 options: [.withSecurityScope],
                 includingResourceValuesForKeys: nil,
@@ -124,10 +127,26 @@ final class AppModel {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
+            isBusy = true
+            progressDescription = String(localized: "Optimizing exclusion rules…")
+            let optimizedRules: [String]
+            do {
+                optimizedRules = try await exclusionOptimizer.optimizedRules(
+                    repositoryURL: url,
+                    including: globalExclusionRules
+                )
+            } catch {
+                isBusy = false
+                progressDescription = ""
+                throw error
+            }
+            isBusy = false
+            progressDescription = ""
             let record = RepositoryRecord(
                 displayName: url.lastPathComponent,
                 bookmark: bookmark,
-                handoffBookmark: handoffBookmark
+                handoffBookmark: handoffBookmark,
+                customExclusionRules: optimizedRules
             )
             try await registry.add(record)
             do {
@@ -141,6 +160,8 @@ final class AppModel {
                 throw error
             }
         } catch {
+            isBusy = false
+            progressDescription = ""
             present(error)
         }
     }

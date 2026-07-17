@@ -68,6 +68,7 @@
 "Choose" = "Choose";
 "Verifying and restoring…" = "Verifying and restoring…";
 "Preparing snapshot…" = "Preparing snapshot…";
+"Optimizing exclusion rules…" = "Optimizing exclusion rules…";
 "%lld files • %@" = "%lld files • %@";
 "Durepo Error" = "Durepo Error";
 "OK" = "OK";

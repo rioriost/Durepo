@@ -112,7 +112,9 @@ public actor RepositoryExclusionOptimizer {
             if itemCount > maximumItemCount { break }
 
             let relativePath = try url.safeRelativePath(from: repositoryURL)
-            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else {
+                continue
+            }
             if values.isSymbolicLink == true { continue }
 
             if values.isDirectory == true {

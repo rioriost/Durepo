@@ -447,7 +447,8 @@ struct SettingsView: View {
                     set: { model.updateGlobalExclusionRules($0) }
                 )
             )
-            .frame(minHeight: 200)
+            .frame(height: 180)
+            .padding(.bottom, 16)
         }
         .frame(minHeight: 390)
         .navigationTitle("Durepo Settings")

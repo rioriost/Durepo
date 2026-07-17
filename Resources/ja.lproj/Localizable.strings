@@ -68,6 +68,7 @@
 "Choose" = "選択";
 "Verifying and restoring…" = "検証して復元しています…";
 "Preparing snapshot…" = "スナップショットを準備しています…";
+"Optimizing exclusion rules…" = "除外ルールを最適化しています…";
 "%lld files • %@" = "%lldファイル • %@";
 "Durepo Error" = "Durepoエラー";
 "OK" = "OK";
