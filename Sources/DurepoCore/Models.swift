@@ -156,6 +156,24 @@ public struct SnapshotSummary: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum SnapshotDeletionMode: Sendable, Equatable {
+    /// Deletes snapshot metadata and manifests while retaining content-addressed objects.
+    case keepObjects
+
+    /// Also deletes objects referenced by the removed snapshots when no retained snapshot uses them.
+    case purgeUnreferencedObjects
+}
+
+public struct SnapshotDeletionResult: Sendable, Equatable {
+    public let deletedSnapshotCount: Int
+    public let deletedObjectCount: Int
+
+    public init(deletedSnapshotCount: Int, deletedObjectCount: Int) {
+        self.deletedSnapshotCount = deletedSnapshotCount
+        self.deletedObjectCount = deletedObjectCount
+    }
+}
+
 public struct RepositoryMonitorState: Sendable {
     public let lastSeenEventID: UInt64
     public let lastCommittedEventID: UInt64
@@ -193,6 +211,7 @@ public enum DurepoError: Error, LocalizedError, Sendable {
     case bookmarkAccessDenied
     case unsupportedFormat(Int)
     case corruptManifest(String)
+    case repositoryNotRegistered
 
     public var errorDescription: String? {
         switch self {
@@ -207,6 +226,7 @@ public enum DurepoError: Error, LocalizedError, Sendable {
         case .bookmarkAccessDenied: localized("Access to the selected folder was denied.")
         case .unsupportedFormat(let version): localized("Unsupported snapshot format: %lld", Int64(version))
         case .corruptManifest(let path): localized("Snapshot manifest is corrupted: %@", path)
+        case .repositoryNotRegistered: localized("The repository is no longer registered for protection.")
         }
     }
 

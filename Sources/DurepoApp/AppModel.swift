@@ -140,10 +140,23 @@ final class AppModel {
         }
     }
 
-    func remove(_ record: RepositoryRecord) async {
+    func remove(_ record: RepositoryRecord, deletionMode: SnapshotDeletionMode) async {
+        isBusy = true
+        progressDescription = String(localized: "Deleting snapshots…")
+        defer {
+            isBusy = false
+            progressDescription = ""
+        }
         do {
             try await registry.remove(id: record.id)
+            do {
+                _ = try await store.deleteSnapshots(repositoryID: record.id, mode: deletionMode)
+            } catch {
+                try? await registry.add(record)
+                throw error
+            }
             repositories.removeAll { $0.id == record.id }
+            snapshots.removeAll { $0.repositoryID == record.id }
             if selectedRepositoryID == record.id {
                 selectedRepositoryID = repositories.first?.id
             }
@@ -265,6 +278,7 @@ final class AppModel {
             repositoryURL: url,
             repositoryID: record.id,
             reason: reason,
+            requiresRegisteredRepository: true,
             progress: { [weak self] progress in
                 Task { @MainActor in
                     self?.progressDescription = String(

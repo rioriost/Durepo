@@ -295,6 +295,32 @@ final class SQLiteMetadata {
         }
     }
 
+    func manifestFiles(repositoryID: UUID) throws -> [String] {
+        try withStatement("""
+            SELECT manifest_file FROM snapshots
+            WHERE repository_id = ? ORDER BY created_at DESC
+            """) { statement in
+                bind(repositoryID.uuidString, at: 1, in: statement)
+                var result: [String] = []
+                while sqlite3_step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
+                return result
+            }
+    }
+
+    func deleteRepositoryData(repositoryID: UUID) throws {
+        try transaction {
+            for table in [
+                "snapshots", "current_entries", "repository_indexes", "event_paths",
+                "event_batches", "monitor_state", "agent_errors",
+            ] {
+                try withStatement("DELETE FROM \(table) WHERE repository_id = ?") { statement in
+                    bind(repositoryID.uuidString, at: 1, in: statement)
+                    try stepDone(statement)
+                }
+            }
+        }
+    }
+
     func repositoryIDs() throws -> [UUID] {
         try withStatement("SELECT DISTINCT repository_id FROM snapshots") { statement in
             var result: [UUID] = []

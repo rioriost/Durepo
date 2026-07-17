@@ -19,6 +19,13 @@
 "No protected repositories" = "保護対象のリポジトリはありません";
 "Choose a repository or project folder. Durepo includes its .git directory and uncommitted files." = "リポジトリまたはプロジェクトフォルダを選択してください。.gitディレクトリと未コミットファイルも保存します。";
 "Snapshot Now" = "今すぐスナップショット";
+"Remove Repository…" = "リポジトリを削除…";
+"Remove Repository?" = "リポジトリを削除しますか？";
+"Background protection for this repository will stop. You can retain its deduplicated file data or permanently delete data that no other snapshot uses." = "このリポジトリのバックグラウンド保護を停止します。重複排除されたファイルデータを残すか、他のスナップショットが使用していないデータまで完全に削除できます。";
+"Cancel" = "キャンセル";
+"Delete Snapshots" = "スナップショットを削除";
+"Permanently Delete Snapshots" = "スナップショットを完全に削除";
+"Deleting snapshots…" = "スナップショットを削除しています…";
 "Repository" = "リポジトリ";
 "All Repositories" = "すべてのリポジトリ";
 "No snapshots" = "スナップショットがありません";
@@ -64,3 +71,4 @@
 "Restore destination already exists: %@" = "復元先がすでに存在します：%@";
 "Access to the selected folder was denied." = "選択したフォルダへのアクセスが拒否されました。";
 "Unsupported snapshot format: %lld" = "対応していないスナップショット形式です：%lld";
+"The repository is no longer registered for protection." = "このリポジトリは保護対象から削除されています。";

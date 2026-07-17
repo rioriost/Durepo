@@ -191,13 +191,16 @@ private actor AgentCoordinator {
                     repositoryURL: session.url,
                     repositoryID: session.record.id,
                     reason: .fileSystemEvent,
-                    changeSet: changeSet
+                    changeSet: changeSet,
+                    requiresRegisteredRepository: true
                 )
                 let committed = try await store.commitEvents(repositoryID: repositoryID, through: targetEventID)
                 try await store.clearAgentError(repositoryID: repositoryID)
                 logger.info("Created snapshot \(manifest.id.uuidString, privacy: .public) through event \(targetEventID)")
                 guard committed.hasPendingEvents else { return }
                 logger.info("Changes arrived during snapshot; rescanning \(session.record.displayName, privacy: .private)")
+            } catch DurepoError.repositoryNotRegistered {
+                return
             } catch {
                 await report(error, repositoryID: repositoryID)
                 scheduleRetry(for: repositoryID)

@@ -101,6 +101,68 @@ struct SnapshotStoreTests {
         }
     }
 
+    @Test("Deleting snapshots can retain content-addressed objects")
+    func snapshotDeletionKeepsObjects() async throws {
+        try await withFixture { fixture in
+            let repositoryID = UUID()
+            try fixture.write("recoverable", to: "file.txt")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let manifest = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .manual
+            )
+            let hash = try #require(manifest.entries.first { $0.relativePath == "file.txt" }?.contentHash)
+            let object = await store.objectURL(for: hash)
+
+            let result = try await store.deleteSnapshots(repositoryID: repositoryID, mode: .keepObjects)
+
+            #expect(result == SnapshotDeletionResult(deletedSnapshotCount: 1, deletedObjectCount: 0))
+            #expect(FileManager.default.fileExists(atPath: object.path))
+            #expect(try await store.snapshotSummaries(repositoryID: repositoryID).isEmpty)
+        }
+    }
+
+    @Test("Permanent deletion removes only objects unreferenced by retained snapshots")
+    func permanentSnapshotDeletionPreservesSharedObjects() async throws {
+        try await withFixture { fixture in
+            let repositoryA = UUID()
+            let repositoryB = UUID()
+            try fixture.write("shared", to: "shared.txt")
+            try fixture.write("only-a", to: "unique.txt")
+            let secondRepository = fixture.root.appending(path: "repository-b", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: secondRepository, withIntermediateDirectories: true)
+            try Data("shared".utf8).write(to: secondRepository.appending(path: "shared.txt"))
+
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let manifestA = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryA,
+                reason: .manual
+            )
+            let manifestB = try await store.createSnapshot(
+                repositoryURL: secondRepository,
+                repositoryID: repositoryB,
+                reason: .manual
+            )
+            let sharedHash = try #require(manifestA.entries.first { $0.relativePath == "shared.txt" }?.contentHash)
+            let uniqueHash = try #require(manifestA.entries.first { $0.relativePath == "unique.txt" }?.contentHash)
+            #expect(manifestB.entries.first?.contentHash == sharedHash)
+
+            let result = try await store.deleteSnapshots(
+                repositoryID: repositoryA,
+                mode: .purgeUnreferencedObjects
+            )
+
+            #expect(result == SnapshotDeletionResult(deletedSnapshotCount: 1, deletedObjectCount: 1))
+            #expect(!FileManager.default.fileExists(atPath: await store.objectURL(for: uniqueHash).path))
+            #expect(FileManager.default.fileExists(atPath: await store.objectURL(for: sharedHash).path))
+            try await store.verify(manifestB)
+            #expect(try await store.snapshotSummaries(repositoryID: repositoryA).isEmpty)
+            #expect(try await store.snapshotSummaries(repositoryID: repositoryB).count == 1)
+        }
+    }
+
     @Test("Events arriving during a snapshot remain pending")
     func eventJournalCommitBoundary() async throws {
         try await withFixture { fixture in

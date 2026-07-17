@@ -11,6 +11,7 @@ public actor SnapshotStore {
     private let objectsURL: URL
     private let manifestsURL: URL
     private let temporaryURL: URL
+    private let lockURL: URL
     private let fileManager: FileManager
     private let excludedDirectoryNames: Set<String>
     private let retentionLimit: Int
@@ -36,6 +37,7 @@ public actor SnapshotStore {
         self.objectsURL = storageURL.appending(path: "objects", directoryHint: .isDirectory)
         self.manifestsURL = storageURL.appending(path: "manifests", directoryHint: .isDirectory)
         self.temporaryURL = storageURL.appending(path: "temp", directoryHint: .isDirectory)
+        self.lockURL = storageURL.appending(path: ".store.lock")
         self.fileManager = fileManager
         self.excludedDirectoryNames = excludedDirectoryNames
         self.retentionLimit = max(1, retentionLimit)
@@ -67,9 +69,18 @@ public actor SnapshotStore {
         repositoryID: UUID,
         reason: SnapshotReason,
         changeSet: SnapshotChangeSet? = nil,
+        requiresRegisteredRepository: Bool = false,
         progress: (@Sendable (SnapshotProgress) -> Void)? = nil
     ) async throws -> SnapshotManifest {
         try prepare()
+        let lockDescriptor = try acquireExclusiveStoreLock()
+        defer { releaseStoreLock(lockDescriptor) }
+        if requiresRegisteredRepository {
+            let records = try await RepositoryRegistry(storageURL: storageURL).records()
+            guard records.contains(where: { $0.id == repositoryID && $0.isEnabled }) else {
+                throw DurepoError.repositoryNotRegistered
+            }
+        }
 
         let signpostID = OSSignpostID(log: Self.performanceLog)
         os_signpost(.begin, log: Self.performanceLog, name: "CreateSnapshot", signpostID: signpostID)
@@ -153,6 +164,65 @@ public actor SnapshotStore {
         }
     }
 
+    @discardableResult
+    public func deleteSnapshots(
+        repositoryID: UUID,
+        mode: SnapshotDeletionMode
+    ) throws -> SnapshotDeletionResult {
+        try prepare()
+        let lockDescriptor = try acquireExclusiveStoreLock()
+        defer { releaseStoreLock(lockDescriptor) }
+
+        let manifestFiles = try metadataStore.manifestFiles(repositoryID: repositoryID)
+        let manifestFileSet = Set(manifestFiles)
+        var hashesToConsider: Set<String> = []
+        var hashesStillReferenced: Set<String> = []
+
+        if mode == .purgeUnreferencedObjects {
+            for file in manifestFiles {
+                let manifest = try decodeManifestFile(file)
+                hashesToConsider.formUnion(validContentHashes(in: manifest))
+            }
+            hashesStillReferenced = try referencedContentHashes(excluding: manifestFileSet)
+        }
+
+        try metadataStore.deleteRepositoryData(repositoryID: repositoryID)
+        for file in manifestFiles {
+            let url = manifestsURL.appending(path: file)
+            guard fileManager.fileExists(atPath: url.path) else { continue }
+            do {
+                try fileManager.removeItem(at: url)
+            } catch {
+                guard !fileManager.fileExists(atPath: url.path) else { throw error }
+            }
+        }
+        if !manifestFiles.isEmpty { try Self.synchronizeDirectory(manifestsURL) }
+
+        var deletedObjectCount = 0
+        if mode == .purgeUnreferencedObjects {
+            var modifiedObjectDirectories: Set<URL> = []
+            for hash in hashesToConsider.subtracting(hashesStillReferenced) {
+                let url = objectURL(for: hash)
+                guard fileManager.fileExists(atPath: url.path) else { continue }
+                do {
+                    try fileManager.removeItem(at: url)
+                    deletedObjectCount += 1
+                    modifiedObjectDirectories.insert(url.deletingLastPathComponent())
+                } catch {
+                    guard !fileManager.fileExists(atPath: url.path) else { throw error }
+                }
+            }
+            for directory in modifiedObjectDirectories {
+                try Self.synchronizeDirectory(directory)
+            }
+        }
+
+        return SnapshotDeletionResult(
+            deletedSnapshotCount: manifestFiles.count,
+            deletedObjectCount: deletedObjectCount
+        )
+    }
+
     public func prepareMonitor(repositoryID: UUID, volumeID: String, rootID: String) throws -> RepositoryMonitorState {
         try prepare()
         return try metadataStore.prepareMonitor(repositoryID: repositoryID, volumeID: volumeID, rootID: rootID)
@@ -228,6 +298,62 @@ public actor SnapshotStore {
         return objectsURL
             .appending(path: prefix, directoryHint: .isDirectory)
             .appending(path: hash)
+    }
+
+    private func decodeManifestFile(_ file: String) throws -> SnapshotManifest {
+        let url = manifestsURL.appending(path: file)
+        do {
+            return try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+        } catch {
+            throw DurepoError.corruptManifest(url.path)
+        }
+    }
+
+    private func referencedContentHashes(excluding excludedFiles: Set<String>) throws -> Set<String> {
+        let urls = try fileManager.contentsOfDirectory(at: manifestsURL, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" && !excludedFiles.contains($0.lastPathComponent) }
+        var hashes: Set<String> = []
+        for url in urls {
+            do {
+                let manifest = try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+                hashes.formUnion(validContentHashes(in: manifest))
+            } catch {
+                throw DurepoError.corruptManifest(url.path)
+            }
+        }
+        return hashes
+    }
+
+    private func validContentHashes(in manifest: SnapshotManifest) -> Set<String> {
+        Set(manifest.entries.compactMap { entry in
+            guard entry.kind == .file, let hash = entry.contentHash, Self.isValidContentHash(hash) else {
+                return nil
+            }
+            return hash
+        })
+    }
+
+    private static func isValidContentHash(_ hash: String) -> Bool {
+        hash.utf8.count == 64 && hash.utf8.allSatisfy {
+            ($0 >= Character("0").asciiValue! && $0 <= Character("9").asciiValue!) ||
+                ($0 >= Character("a").asciiValue! && $0 <= Character("f").asciiValue!)
+        }
+    }
+
+    private func acquireExclusiveStoreLock() throws -> Int32 {
+        let descriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { throw Self.posixError() }
+        guard Darwin.lockf(descriptor, F_LOCK, 0) == 0 else {
+            let error = Self.posixError()
+            Darwin.close(descriptor)
+            throw error
+        }
+        return descriptor
+    }
+
+    private func releaseStoreLock(_ descriptor: Int32) {
+        _ = Darwin.lockf(descriptor, F_ULOCK, 0)
+        Darwin.close(descriptor)
     }
 
     private func collectIncrementalChanges(

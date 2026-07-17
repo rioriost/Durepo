@@ -103,6 +103,7 @@ private struct MetricCard: View {
 
 private struct RepositoriesView: View {
     @Bindable var model: AppModel
+    @State private var repositoryPendingDeletion: RepositoryRecord?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -134,10 +135,11 @@ private struct RepositoriesView: View {
                             }
                             .disabled(model.isBusy)
                             Button(role: .destructive) {
-                                Task { await model.remove(repository) }
+                                repositoryPendingDeletion = repository
                             } label: {
                                 Image(systemName: "trash")
                             }
+                            .help("Remove Repository…")
                             .buttonStyle(.borderless)
                         }
                         .padding(.vertical, 5)
@@ -147,6 +149,59 @@ private struct RepositoriesView: View {
             }
         }
         .padding(24)
+        .sheet(item: $repositoryPendingDeletion) { repository in
+            RepositoryDeletionDialog(
+                repository: repository,
+                cancel: { repositoryPendingDeletion = nil },
+                deleteSnapshots: {
+                    repositoryPendingDeletion = nil
+                    Task { await model.remove(repository, deletionMode: .keepObjects) }
+                },
+                permanentlyDeleteSnapshots: {
+                    repositoryPendingDeletion = nil
+                    Task { await model.remove(repository, deletionMode: .purgeUnreferencedObjects) }
+                }
+            )
+        }
+    }
+}
+
+private struct RepositoryDeletionDialog: View {
+    let repository: RepositoryRecord
+    let cancel: () -> Void
+    let deleteSnapshots: () -> Void
+    let permanentlyDeleteSnapshots: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Remove Repository?")
+                        .font(.title2.bold())
+                    Text(repository.displayName)
+                        .font(.headline)
+                    Text("Background protection for this repository will stop. You can retain its deduplicated file data or permanently delete data that no other snapshot uses.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button("Cancel", action: cancel)
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Delete Snapshots", action: deleteSnapshots)
+                Button("Permanently Delete Snapshots", role: .destructive, action: permanentlyDeleteSnapshots)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+            }
+        }
+        .padding(24)
+        .frame(width: 680)
+        .interactiveDismissDisabled()
     }
 }
 

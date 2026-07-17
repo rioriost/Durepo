@@ -101,6 +101,7 @@ Apple資料:
 - 通常FSEventではdirty pathだけを再取得し、未変更ファイルはSQLite indexのhashを再利用する。
 - APFS cloneの元ファイル削除後もsnapshot verifyとrestoreが成功する。
 - clone非対応時のmemory/streaming fallbackが同じmanifest/restore semanticsを保つ。
+- repository削除時に確認ダイアログを表示し、manifestのみの削除と、他snapshotから未参照のCAS objectを含む完全削除を選択できる。
 - backup保存先がrepo配下なら拒否する。
 - Xcode 26 stableでGUI、Core framework、Agentがbuildできる。
 - `.app`内にSandbox entitlements付きmain app、embedded agent、LaunchAgent plist、日英localization、AppIconがある。

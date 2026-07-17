@@ -19,6 +19,13 @@
 "No protected repositories" = "No protected repositories";
 "Choose a repository or project folder. Durepo includes its .git directory and uncommitted files." = "Choose a repository or project folder. Durepo includes its .git directory and uncommitted files.";
 "Snapshot Now" = "Snapshot Now";
+"Remove Repository…" = "Remove Repository…";
+"Remove Repository?" = "Remove Repository?";
+"Background protection for this repository will stop. You can retain its deduplicated file data or permanently delete data that no other snapshot uses." = "Background protection for this repository will stop. You can retain its deduplicated file data or permanently delete data that no other snapshot uses.";
+"Cancel" = "Cancel";
+"Delete Snapshots" = "Delete Snapshots";
+"Permanently Delete Snapshots" = "Permanently Delete Snapshots";
+"Deleting snapshots…" = "Deleting snapshots…";
 "Repository" = "Repository";
 "All Repositories" = "All Repositories";
 "No snapshots" = "No snapshots";
@@ -64,3 +71,4 @@
 "Restore destination already exists: %@" = "Restore destination already exists: %@";
 "Access to the selected folder was denied." = "Access to the selected folder was denied.";
 "Unsupported snapshot format: %lld" = "Unsupported snapshot format: %lld";
+"The repository is no longer registered for protection." = "The repository is no longer registered for protection.";
