@@ -1,0 +1,21 @@
+.DS_Store
+.build/
+.swiftpm/
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcarchive
+*.ipa
+*.dmg
+*.pkg
+*.zip
+*.xcresult
+.env
+*.p8
+*.cer
+*.p12
+notary-profile.json
+
+# XcodeGen produces this deterministically from project.yml.
+Durepo.xcodeproj/

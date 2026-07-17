@@ -1,0 +1,146 @@
+name: Durepo
+options:
+  bundleIdPrefix: st.rio
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: 23889H77KX
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.0"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+targets:
+  DurepoCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/DurepoCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: st.rio.DurepoCore
+        PRODUCT_NAME: DurepoCore
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: YES
+        GENERATE_INFOPLIST_FILE: YES
+  DurepoAgent:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources/DurepoAgent
+      - path: Config/DurepoAgent.entitlements
+        buildPhase: none
+    dependencies:
+      - target: DurepoCore
+    entitlements:
+      path: Config/DurepoAgent.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups:
+          - 23889H77KX.st.rio.Durepo
+        com.apple.security.files.bookmarks.app-scope: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: st.rio.Durepo.Agent
+        PRODUCT_NAME: DurepoAgent
+        CODE_SIGN_ENTITLEMENTS: "$(SRCROOT)/Config/DurepoAgent.entitlements"
+        ENABLE_APP_SANDBOX: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @loader_path/../Frameworks"
+  Durepo:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/DurepoApp
+      - path: Resources
+        buildPhase: resources
+        excludes:
+          - AppIcon-master.png
+          - AppIconSource/**
+      - path: Config/Durepo.entitlements
+        buildPhase: none
+    dependencies:
+      - target: DurepoCore
+        embed: true
+      - target: DurepoAgent
+    info:
+      path: Config/Info.plist
+      properties:
+        CFBundleDevelopmentRegion: en
+        CFBundleDisplayName: Durepo
+        CFBundleExecutable: "$(EXECUTABLE_NAME)"
+        CFBundleIconName: AppIcon
+        CFBundleIdentifier: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+        CFBundleInfoDictionaryVersion: "6.0"
+        CFBundleName: Durepo
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSApplicationCategoryType: public.app-category.utilities
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NSHumanReadableCopyright: "Copyright © 2026 Rio Fujita. All rights reserved."
+        ITSAppUsesNonExemptEncryption: false
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+    entitlements:
+      path: Config/Durepo.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups:
+          - 23889H77KX.st.rio.Durepo
+        com.apple.security.files.bookmarks.app-scope: true
+        com.apple.security.files.user-selected.read-write: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: st.rio.Durepo
+        PRODUCT_NAME: Durepo
+        CODE_SIGN_ENTITLEMENTS: "$(SRCROOT)/Config/Durepo.entitlements"
+        ENABLE_APP_SANDBOX: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    postCompileScripts:
+      - name: Embed LaunchAgent
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - "$(SRCROOT)/Config/st.rio.Durepo.Agent.plist"
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/st.rio.Durepo.Agent.plist"
+        script: |
+          set -eu
+          agent_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents"
+          mkdir -p "${agent_dir}"
+          cp "${SRCROOT}/Config/st.rio.Durepo.Agent.plist" "${agent_dir}/st.rio.Durepo.Agent.plist"
+  DurepoCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/DurepoCoreTests
+    dependencies:
+      - target: DurepoCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: st.rio.DurepoCoreTests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Durepo:
+    build:
+      targets:
+        Durepo: all
+        DurepoAgent: all
+        DurepoCoreTests: [test]
+    run:
+      config: Debug
+    test:
+      gatherCoverageData: true
+      coverageTargets:
+        - DurepoCore
+      targets:
+        - DurepoCoreTests
+    archive:
+      config: Release
