@@ -10,12 +10,232 @@ public enum DurepoConstants {
     ]
 }
 
+public struct ExclusionRuleSet: Codable, Hashable, Sendable {
+    public let rules: [String]
+    private let parsedRules: [ParsedExclusionRule]
+
+    public init(_ rules: some Sequence<String>) {
+        self.rules = rules.compactMap(Self.normalizedRule)
+        self.parsedRules = self.rules.compactMap(ParsedExclusionRule.init)
+    }
+
+    public static let defaults = ExclusionRuleSet(DurepoConstants.defaultExcludedDirectoryNames.sorted())
+
+    public func excludes(_ relativePath: String, isDirectory: Bool = false) -> Bool {
+        let path = Self.normalizedPath(relativePath)
+        guard !path.isEmpty else { return false }
+        let components = path.split(separator: "/").map(String.init)
+
+        // Git metadata is a core recovery target and cannot be excluded.
+        guard !components.contains(".git") else { return false }
+
+        for componentIndex in components.indices {
+            let candidate = components[...componentIndex].joined(separator: "/")
+            let candidateIsDirectory = componentIndex < components.index(before: components.endIndex) || isDirectory
+            var ignored = false
+            for rule in parsedRules where rule.matches(candidate, isDirectory: candidateIsDirectory) {
+                ignored = !rule.isNegated
+            }
+            if ignored { return true }
+        }
+        return false
+    }
+
+    public static func normalizedRule(_ rawRule: String) -> String? {
+        var rule = rawRule.trimmingCharacters(in: .newlines)
+        while rule.last == " " && !rule.hasSuffix("\\ ") { rule.removeLast() }
+        guard !rule.isEmpty, rule != "!" else { return nil }
+        return rule
+    }
+
+    private enum CodingKeys: String, CodingKey { case rules }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(try container.decode([String].self, forKey: .rules))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(rules, forKey: .rules)
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        var result = path
+        while result.hasPrefix("./") { result.removeFirst(2) }
+        while result.hasPrefix("/") { result.removeFirst() }
+        while result.hasSuffix("/") { result.removeLast() }
+        return result
+    }
+
+}
+
+private struct ParsedExclusionRule: Hashable, Sendable {
+    let pattern: String
+    let isNegated: Bool
+    let isDirectoryOnly: Bool
+    let isAnchored: Bool
+    let containsSlash: Bool
+
+    init?(_ rawRule: String) {
+        guard !rawRule.hasPrefix("#") else { return nil }
+        var value = rawRule
+        let escapedPrefix = value.hasPrefix("\\#") || value.hasPrefix("\\!")
+        if escapedPrefix {
+            value.removeFirst()
+            isNegated = false
+        } else if value.hasPrefix("!") {
+            value.removeFirst()
+            isNegated = true
+        } else {
+            isNegated = false
+        }
+
+        isDirectoryOnly = value.hasSuffix("/") && !value.hasSuffix("\\/")
+        if isDirectoryOnly { value.removeLast() }
+        isAnchored = value.hasPrefix("/")
+        if isAnchored { value.removeFirst() }
+        guard !value.isEmpty else { return nil }
+        pattern = value
+        containsSlash = value.contains("/")
+    }
+
+    func matches(_ relativePath: String, isDirectory: Bool) -> Bool {
+        guard !isDirectoryOnly || isDirectory else { return false }
+        let candidate = containsSlash || isAnchored
+            ? relativePath
+            : relativePath.split(separator: "/").last.map(String.init) ?? relativePath
+        return Self.gitIgnoreGlob(pattern, matches: candidate)
+    }
+
+    private struct MatchPosition: Hashable {
+        let pattern: Int
+        let value: Int
+    }
+
+    private static func gitIgnoreGlob(_ patternString: String, matches valueString: String) -> Bool {
+        let pattern = Array(patternString)
+        let value = Array(valueString)
+        var memo: [MatchPosition: Bool] = [:]
+
+        func matches(_ patternIndex: Int, _ valueIndex: Int) -> Bool {
+            let position = MatchPosition(pattern: patternIndex, value: valueIndex)
+            if let cached = memo[position] { return cached }
+            let result: Bool
+
+            if patternIndex == pattern.count {
+                result = valueIndex == value.count
+            } else {
+                switch pattern[patternIndex] {
+                case "*":
+                    var nextPatternIndex = patternIndex
+                    while nextPatternIndex < pattern.count && pattern[nextPatternIndex] == "*" {
+                        nextPatternIndex += 1
+                    }
+                    let isGlobstar = nextPatternIndex - patternIndex > 1
+                    if isGlobstar {
+                        let skipsFollowingSlash = nextPatternIndex < pattern.count && pattern[nextPatternIndex] == "/"
+                        result = matches(nextPatternIndex, valueIndex)
+                            || (skipsFollowingSlash && matches(nextPatternIndex + 1, valueIndex))
+                            || (valueIndex < value.count && matches(patternIndex, valueIndex + 1))
+                    } else {
+                        result = matches(nextPatternIndex, valueIndex)
+                            || (valueIndex < value.count && value[valueIndex] != "/"
+                                && matches(patternIndex, valueIndex + 1))
+                    }
+                case "?":
+                    result = valueIndex < value.count && value[valueIndex] != "/"
+                        && matches(patternIndex + 1, valueIndex + 1)
+                case "[":
+                    if valueIndex < value.count,
+                       value[valueIndex] != "/",
+                       let characterClass = characterClass(in: pattern, from: patternIndex) {
+                        result = characterClass.matches(value[valueIndex])
+                            && matches(characterClass.nextPatternIndex, valueIndex + 1)
+                    } else {
+                        result = valueIndex < value.count && value[valueIndex] == "["
+                            && matches(patternIndex + 1, valueIndex + 1)
+                    }
+                case "\\":
+                    let literalIndex = patternIndex + 1
+                    if literalIndex < pattern.count {
+                        result = valueIndex < value.count && value[valueIndex] == pattern[literalIndex]
+                            && matches(literalIndex + 1, valueIndex + 1)
+                    } else {
+                        result = valueIndex < value.count && value[valueIndex] == "\\"
+                            && matches(patternIndex + 1, valueIndex + 1)
+                    }
+                default:
+                    result = valueIndex < value.count && pattern[patternIndex] == value[valueIndex]
+                        && matches(patternIndex + 1, valueIndex + 1)
+                }
+            }
+            memo[position] = result
+            return result
+        }
+
+        return matches(0, 0)
+    }
+
+    private struct CharacterClass {
+        let characters: Set<Character>
+        let ranges: [(Character, Character)]
+        let isNegated: Bool
+        let nextPatternIndex: Int
+
+        func matches(_ character: Character) -> Bool {
+            let scalar = character.unicodeScalars.first?.value
+            let contained = characters.contains(character) || ranges.contains { lower, upper in
+                guard let scalar,
+                      let lower = lower.unicodeScalars.first?.value,
+                      let upper = upper.unicodeScalars.first?.value else { return false }
+                return lower <= scalar && scalar <= upper
+            }
+            return isNegated ? !contained : contained
+        }
+    }
+
+    private static func characterClass(in pattern: [Character], from start: Int) -> CharacterClass? {
+        var index = start + 1
+        guard index < pattern.count else { return nil }
+        var isNegated = false
+        if pattern[index] == "!" || pattern[index] == "^" {
+            isNegated = true
+            index += 1
+        }
+        var characters: Set<Character> = []
+        var ranges: [(Character, Character)] = []
+        var previous: Character?
+        while index < pattern.count, pattern[index] != "]" {
+            let character = pattern[index]
+            if character == "-", let lower = previous, index + 1 < pattern.count, pattern[index + 1] != "]" {
+                ranges.append((lower, pattern[index + 1]))
+                characters.remove(lower)
+                previous = nil
+                index += 2
+                continue
+            }
+            characters.insert(character)
+            previous = character
+            index += 1
+        }
+        guard index < pattern.count, pattern[index] == "]" else { return nil }
+        return CharacterClass(
+            characters: characters,
+            ranges: ranges,
+            isNegated: isNegated,
+            nextPatternIndex: index + 1
+        )
+    }
+}
+
 public struct RepositoryRecord: Codable, Identifiable, Hashable, Sendable {
     public let id: UUID
     public var displayName: String
     public var bookmark: Data
     public var agentBookmark: Data?
     public var handoffBookmark: Data?
+    public var customExclusionRules: [String]?
     public var addedAt: Date
     public var isEnabled: Bool
 
@@ -25,6 +245,7 @@ public struct RepositoryRecord: Codable, Identifiable, Hashable, Sendable {
         bookmark: Data,
         agentBookmark: Data? = nil,
         handoffBookmark: Data? = nil,
+        customExclusionRules: [String]? = nil,
         addedAt: Date = .now,
         isEnabled: Bool = true
     ) {
@@ -33,8 +254,13 @@ public struct RepositoryRecord: Codable, Identifiable, Hashable, Sendable {
         self.bookmark = bookmark
         self.agentBookmark = agentBookmark
         self.handoffBookmark = handoffBookmark
+        self.customExclusionRules = customExclusionRules
         self.addedAt = addedAt
         self.isEnabled = isEnabled
+    }
+
+    public func effectiveExclusionRules(globalRules: [String]) -> ExclusionRuleSet {
+        ExclusionRuleSet(customExclusionRules ?? globalRules)
     }
 }
 

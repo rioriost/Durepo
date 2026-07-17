@@ -23,6 +23,7 @@ final class AppModel {
     var selection: AppSection? = .dashboard
     var repositories: [RepositoryRecord] = []
     var snapshots: [SnapshotSummary] = []
+    var globalExclusionRules = ExclusionRuleSet.defaults.rules
     var selectedRepositoryID: UUID?
     var isBusy = false
     var progressDescription = ""
@@ -32,6 +33,8 @@ final class AppModel {
 
     private let storageURL: URL
     private let registry: RepositoryRegistry
+    private let exclusionRuleStore: GlobalExclusionRuleStore
+    private let exclusionOptimizer = RepositoryExclusionOptimizer()
     private let store: SnapshotStore
     private var pendingAgentHandoffURLs: [UUID: URL] = [:]
     private var presentedAgentErrorID: UUID?
@@ -46,6 +49,7 @@ final class AppModel {
         }
         storageURL = resolvedStorage
         registry = RepositoryRegistry(storageURL: resolvedStorage)
+        exclusionRuleStore = GlobalExclusionRuleStore(storageURL: resolvedStorage)
         store = SnapshotStore(storageURL: resolvedStorage)
         refreshServiceStatuses()
     }
@@ -83,6 +87,7 @@ final class AppModel {
 
     func load() async {
         do {
+            globalExclusionRules = try exclusionRuleStore.rules()
             var loadedRepositories = try await registry.records()
             loadedRepositories = try await prepareAgentHandoffs(for: loadedRepositories)
             repositories = loadedRepositories.sorted { $0.displayName < $1.displayName }
@@ -170,6 +175,71 @@ final class AppModel {
             try await snapshot(record, reason: .manual)
         } catch {
             present(error)
+        }
+    }
+
+    func exclusionRules(for record: RepositoryRecord) -> [String] {
+        record.effectiveExclusionRules(globalRules: globalExclusionRules).rules
+    }
+
+    func updateGlobalExclusionRules(_ rules: [String]) {
+        globalExclusionRules = rules
+        do {
+            try exclusionRuleStore.save(rules)
+            let inheritingRepositoryIDs = repositories
+                .filter { $0.customExclusionRules == nil }
+                .map(\.id)
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    for id in inheritingRepositoryIDs {
+                        try await self.store.requireFullScan(repositoryID: id)
+                    }
+                } catch {
+                    self.present(error)
+                }
+            }
+        } catch {
+            present(error)
+        }
+    }
+
+    func saveExclusionRules(_ rules: [String], for record: RepositoryRecord) async -> Bool {
+        var updated = record
+        updated.customExclusionRules = ExclusionRuleSet(rules).rules
+        do {
+            try await registry.update(updated)
+            if let index = repositories.firstIndex(where: { $0.id == updated.id }) {
+                repositories[index] = updated
+            }
+            try await store.requireFullScan(repositoryID: updated.id)
+            return true
+        } catch {
+            present(error)
+            return false
+        }
+    }
+
+    func optimizedExclusionRules(for record: RepositoryRecord, existingRules: [String]) async -> [String]? {
+        do {
+            var stale = false
+            let url = try URL(
+                resolvingBookmarkData: record.bookmark,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            )
+            guard url.startAccessingSecurityScopedResource() else {
+                throw DurepoError.bookmarkAccessDenied
+            }
+            defer { url.stopAccessingSecurityScopedResource() }
+            return try await exclusionOptimizer.optimizedRules(
+                repositoryURL: url,
+                including: existingRules
+            )
+        } catch {
+            present(error)
+            return nil
         }
     }
 
@@ -278,6 +348,7 @@ final class AppModel {
             repositoryURL: url,
             repositoryID: record.id,
             reason: reason,
+            exclusionRules: record.effectiveExclusionRules(globalRules: globalExclusionRules),
             requiresRegisteredRepository: true,
             progress: { [weak self] progress in
                 Task { @MainActor in

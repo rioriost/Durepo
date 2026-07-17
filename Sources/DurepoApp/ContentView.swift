@@ -104,6 +104,7 @@ private struct MetricCard: View {
 private struct RepositoriesView: View {
     @Bindable var model: AppModel
     @State private var repositoryPendingDeletion: RepositoryRecord?
+    @State private var repositoryEditingExclusions: RepositoryRecord?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -130,6 +131,10 @@ private struct RepositoriesView: View {
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
+                            Button("Edit Exclusion Rules") {
+                                repositoryEditingExclusions = repository
+                            }
+                            .disabled(model.isBusy)
                             Button("Snapshot Now") {
                                 Task { await model.createSnapshot(of: repository) }
                             }
@@ -163,6 +168,147 @@ private struct RepositoriesView: View {
                 }
             )
         }
+        .sheet(item: $repositoryEditingExclusions) { repository in
+            RepositoryExclusionRulesDialog(
+                repository: repository,
+                initialRules: model.exclusionRules(for: repository),
+                cancel: { repositoryEditingExclusions = nil },
+                optimize: { rules in
+                    await model.optimizedExclusionRules(for: repository, existingRules: rules)
+                },
+                save: { rules in
+                    if await model.saveExclusionRules(rules, for: repository) {
+                        repositoryEditingExclusions = nil
+                    }
+                }
+            )
+        }
+    }
+}
+
+private struct RepositoryExclusionRulesDialog: View {
+    let repository: RepositoryRecord
+    let cancel: () -> Void
+    let optimize: ([String]) async -> [String]?
+    let save: ([String]) async -> Void
+
+    @State private var rules: [String]
+    @State private var isOptimizing = false
+    @State private var isSaving = false
+
+    init(
+        repository: RepositoryRecord,
+        initialRules: [String],
+        cancel: @escaping () -> Void,
+        optimize: @escaping ([String]) async -> [String]?,
+        save: @escaping ([String]) async -> Void
+    ) {
+        self.repository = repository
+        self.cancel = cancel
+        self.optimize = optimize
+        self.save = save
+        _rules = State(initialValue: initialRules)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Exclusion Rules")
+                .font(.title2.bold())
+            Text(repository.displayName)
+                .font(.headline)
+            Text("Uses .gitignore syntax. Git metadata is always protected.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ExclusionRuleListEditor(
+                rules: $rules,
+                isOptimizing: isOptimizing,
+                optimize: {
+                    isOptimizing = true
+                    Task {
+                        if let optimized = await optimize(rules) { rules = optimized }
+                        isOptimizing = false
+                    }
+                }
+            )
+            .frame(minHeight: 260)
+
+            Divider()
+
+            HStack {
+                Button("Cancel", action: cancel)
+                    .disabled(isSaving)
+                Spacer()
+                Button("Save") {
+                    isSaving = true
+                    Task {
+                        await save(rules)
+                        isSaving = false
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isSaving || isOptimizing)
+            }
+        }
+        .padding(24)
+        .frame(width: 680, height: 500)
+        .interactiveDismissDisabled()
+    }
+}
+
+private struct ExclusionRuleListEditor: View {
+    @Binding var rules: [String]
+    var isOptimizing = false
+    var optimize: (() -> Void)?
+    @State private var selection: Int?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            List(selection: $selection) {
+                ForEach(rules.indices, id: \.self) { index in
+                    TextField("Exclusion rule", text: ruleBinding(at: index))
+                        .textFieldStyle(.plain)
+                        .tag(index)
+                }
+            }
+            .border(.separator)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Button("Add") {
+                    rules.append("")
+                    selection = rules.indices.last
+                }
+                .frame(maxWidth: .infinity)
+
+                Button("Delete") {
+                    guard let selection, rules.indices.contains(selection) else { return }
+                    rules.remove(at: selection)
+                    self.selection = rules.indices.contains(selection) ? selection : rules.indices.last
+                }
+                .frame(maxWidth: .infinity)
+                .disabled(selection == nil)
+
+                if let optimize {
+                    Button("Optimize for Repository", action: optimize)
+                        .padding(.top, 8)
+                        .frame(maxWidth: .infinity)
+                        .disabled(isOptimizing)
+                    if isOptimizing {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+            .frame(width: 170)
+        }
+    }
+
+    private func ruleBinding(at index: Int) -> Binding<String> {
+        Binding(
+            get: { rules.indices.contains(index) ? rules[index] : "" },
+            set: { if rules.indices.contains(index) { rules[index] = $0 } }
+        )
     }
 }
 
@@ -287,7 +433,23 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                     .disabled(true)
             }
+
+            Divider()
+
+            Text("Default Exclusion Rules")
+                .font(.headline)
+            Text("Uses .gitignore syntax. Repositories inherit these rules until repository-specific rules are saved.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ExclusionRuleListEditor(
+                rules: Binding(
+                    get: { model.globalExclusionRules },
+                    set: { model.updateGlobalExclusionRules($0) }
+                )
+            )
+            .frame(minHeight: 200)
         }
+        .frame(minHeight: 390)
         .navigationTitle("Durepo Settings")
     }
 }

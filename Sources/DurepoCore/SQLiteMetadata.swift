@@ -428,6 +428,17 @@ final class SQLiteMetadata {
         }
     }
 
+    func requireFullScan(repositoryID: UUID) throws {
+        try withStatement("""
+            UPDATE monitor_state SET pending = 1, needs_full_scan = 1, updated_at = ?
+            WHERE repository_id = ?
+            """) { statement in
+                sqlite3_bind_double(statement, 1, Date().timeIntervalSince1970)
+                bind(repositoryID.uuidString, at: 2, in: statement)
+                try stepDone(statement)
+            }
+    }
+
     func pendingChangeSet(repositoryID: UUID, through eventID: UInt64) throws -> SnapshotChangeSet {
         let event = Int64(clamping: eventID)
         let committed = Int64(clamping: try monitorState(repositoryID: repositoryID)?.lastCommittedEventID ?? 0)

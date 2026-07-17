@@ -51,6 +51,94 @@ public actor RepositoryRegistry {
     }
 }
 
+public struct GlobalExclusionRuleStore {
+    private struct Document: Codable {
+        let formatVersion: Int
+        let rules: [String]
+    }
+
+    private let settingsURL: URL
+    private let fileManager: FileManager
+
+    public init(storageURL: URL, fileManager: FileManager = .default) {
+        settingsURL = storageURL.appending(path: "exclusion-rules.json")
+        self.fileManager = fileManager
+    }
+
+    public func rules() throws -> [String] {
+        guard fileManager.fileExists(atPath: settingsURL.path) else {
+            return ExclusionRuleSet.defaults.rules
+        }
+        let document = try JSONDecoder.durepo.decode(Document.self, from: Data(contentsOf: settingsURL))
+        return ExclusionRuleSet(document.rules).rules
+    }
+
+    public func save(_ rules: [String]) throws {
+        let document = Document(formatVersion: 1, rules: ExclusionRuleSet(rules).rules)
+        try AtomicFileWriter.write(JSONEncoder.durepo.encode(document), to: settingsURL, fileManager: fileManager)
+    }
+}
+
+public actor RepositoryExclusionOptimizer {
+    private let fileManager: FileManager
+    private let maximumItemCount: Int
+
+    private static let generatedDirectoryNames: Set<String> = [
+        ".build", ".cache", ".gradle", ".mypy_cache", ".next", ".nuxt", ".pytest_cache",
+        ".ruff_cache", ".svelte-kit", ".tox", ".venv", "CMakeFiles", "DerivedData",
+        "__pycache__", "build", "coverage", "dist", "htmlcov", "node_modules", "target", "venv",
+    ]
+
+    public init(fileManager: FileManager = .default, maximumItemCount: Int = 100_000) {
+        self.fileManager = fileManager
+        self.maximumItemCount = max(1, maximumItemCount)
+    }
+
+    public func optimizedRules(repositoryURL: URL, including existingRules: [String]) throws -> [String] {
+        let normalizedExistingRules = ExclusionRuleSet(existingRules).rules
+        var suggestions: Set<String> = []
+        guard let enumerator = fileManager.enumerator(
+            at: repositoryURL,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsPackageDescendants],
+            errorHandler: { _, _ in true }
+        ) else {
+            throw DurepoError.invalidRepository(repositoryURL.path)
+        }
+
+        var itemCount = 0
+        for case let url as URL in enumerator {
+            itemCount += 1
+            if itemCount > maximumItemCount { break }
+
+            let relativePath = try url.safeRelativePath(from: repositoryURL)
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            if values.isSymbolicLink == true { continue }
+
+            if values.isDirectory == true {
+                if url.lastPathComponent == ".git" {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                if Self.generatedDirectoryNames.contains(url.lastPathComponent) {
+                    suggestions.insert(relativePath + "/")
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+
+            switch url.lastPathComponent {
+            case ".DS_Store": suggestions.insert(".DS_Store")
+            case "CMakeCache.txt": suggestions.insert(relativePath)
+            default:
+                if url.pathExtension == "pyc" { suggestions.insert("*.pyc") }
+            }
+        }
+        let existingSet = Set(normalizedExistingRules)
+        return normalizedExistingRules + suggestions.subtracting(existingSet).sorted()
+    }
+}
+
 extension JSONEncoder {
     static var durepo: JSONEncoder {
         let encoder = JSONEncoder()

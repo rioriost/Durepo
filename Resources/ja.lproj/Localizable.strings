@@ -19,6 +19,16 @@
 "No protected repositories" = "保護対象のリポジトリはありません";
 "Choose a repository or project folder. Durepo includes its .git directory and uncommitted files." = "リポジトリまたはプロジェクトフォルダを選択してください。.gitディレクトリと未コミットファイルも保存します。";
 "Snapshot Now" = "今すぐスナップショット";
+"Edit Exclusion Rules" = "除外ルールの編集";
+"Exclusion Rules" = "除外ルール";
+"Exclusion rule" = "除外ルール";
+"Default Exclusion Rules" = "デフォルトの除外ルール";
+"Add" = "追加";
+"Delete" = "削除";
+"Save" = "保存";
+"Optimize for Repository" = "リポジトリに最適化";
+"Uses .gitignore syntax. Git metadata is always protected." = ".gitignoreと同じ書式を使用します。Gitメタデータは常に保護されます。";
+"Uses .gitignore syntax. Repositories inherit these rules until repository-specific rules are saved." = ".gitignoreと同じ書式を使用します。リポジトリ固有のルールを保存するまでは、このルールを引き継ぎます。";
 "Remove Repository…" = "リポジトリを削除…";
 "Remove Repository?" = "リポジトリを削除しますか？";
 "Background protection for this repository will stop. You can retain its deduplicated file data or permanently delete data that no other snapshot uses." = "このリポジトリのバックグラウンド保護を停止します。重複排除されたファイルデータを残すか、他のスナップショットが使用していないデータまで完全に削除できます。";

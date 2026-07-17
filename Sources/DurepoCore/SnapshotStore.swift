@@ -13,7 +13,7 @@ public actor SnapshotStore {
     private let temporaryURL: URL
     private let lockURL: URL
     private let fileManager: FileManager
-    private let excludedDirectoryNames: Set<String>
+    private let defaultExclusionRules: ExclusionRuleSet
     private let retentionLimit: Int
     private let staleTemporaryAge: TimeInterval
     private let maxConcurrentFileOperations: Int
@@ -39,7 +39,7 @@ public actor SnapshotStore {
         self.temporaryURL = storageURL.appending(path: "temp", directoryHint: .isDirectory)
         self.lockURL = storageURL.appending(path: ".store.lock")
         self.fileManager = fileManager
-        self.excludedDirectoryNames = excludedDirectoryNames
+        self.defaultExclusionRules = ExclusionRuleSet(excludedDirectoryNames)
         self.retentionLimit = max(1, retentionLimit)
         self.staleTemporaryAge = staleTemporaryAge
         self.maxConcurrentFileOperations = max(1, min(4, maxConcurrentFileOperations))
@@ -69,6 +69,7 @@ public actor SnapshotStore {
         repositoryID: UUID,
         reason: SnapshotReason,
         changeSet: SnapshotChangeSet? = nil,
+        exclusionRules: ExclusionRuleSet? = nil,
         requiresRegisteredRepository: Bool = false,
         progress: (@Sendable (SnapshotProgress) -> Void)? = nil
     ) async throws -> SnapshotManifest {
@@ -97,17 +98,24 @@ public actor SnapshotStore {
         guard !root.isDescendant(of: storage) else { throw DurepoError.repositoryInsideStorage }
 
         let requestedIncremental = reason == .fileSystemEvent && changeSet?.needsFullScan == false
+        let effectiveExclusionRules = exclusionRules ?? defaultExclusionRules
         let cachedEntries = requestedIncremental ? try metadataStore.currentEntries(repositoryID: repositoryID) : nil
         let usesFullScan = !requestedIncremental || cachedEntries == nil
         let scanStartedAt = ContinuousClock.now
         var work: SnapshotWork
         if usesFullScan {
-            work = try collectHierarchy(at: root, root: root, includeTopLevelItem: false)
+            work = try collectHierarchy(
+                at: root,
+                root: root,
+                includeTopLevelItem: false,
+                exclusionRules: effectiveExclusionRules
+            )
         } else {
             work = try collectIncrementalChanges(
                 at: root,
                 cachedEntries: cachedEntries ?? [:],
-                changedPaths: changeSet?.changedPaths ?? []
+                changedPaths: changeSet?.changedPaths ?? [],
+                exclusionRules: effectiveExclusionRules
             )
         }
         let scanDuration = scanStartedAt.duration(to: .now)
@@ -245,6 +253,11 @@ public actor SnapshotStore {
         )
     }
 
+    public func requireFullScan(repositoryID: UUID) throws {
+        try prepare()
+        try metadataStore.requireFullScan(repositoryID: repositoryID)
+    }
+
     public func pendingChangeSet(repositoryID: UUID, through eventID: UInt64) throws -> SnapshotChangeSet {
         try prepare()
         return try metadataStore.pendingChangeSet(repositoryID: repositoryID, through: eventID)
@@ -359,11 +372,17 @@ public actor SnapshotStore {
     private func collectIncrementalChanges(
         at root: URL,
         cachedEntries: [String: IndexedSnapshotEntry],
-        changedPaths: [String]
+        changedPaths: [String],
+        exclusionRules: ExclusionRuleSet
     ) throws -> SnapshotWork {
         let paths = try minimizedChangedPaths(changedPaths)
         guard !paths.isEmpty, !paths.contains("") else {
-            return try collectHierarchy(at: root, root: root, includeTopLevelItem: false)
+            return try collectHierarchy(
+                at: root,
+                root: root,
+                includeTopLevelItem: false,
+                exclusionRules: exclusionRules
+            )
         }
 
         var work = SnapshotWork(entries: cachedEntries)
@@ -378,7 +397,8 @@ public actor SnapshotStore {
                     !key.hasPrefix(relativePath + "/")
                 }
             }
-            guard !isExcluded(relativePath) else { continue }
+            let wasDirectory = cachedEntries[relativePath]?.entry.kind == .directory
+            guard !exclusionRules.excludes(relativePath, isDirectory: wasDirectory) else { continue }
 
             var parent = (relativePath as NSString).deletingLastPathComponent
             while !parent.isEmpty && parent != "." {
@@ -388,7 +408,12 @@ public actor SnapshotStore {
 
             let url = root.appending(path: relativePath)
             do {
-                let changedWork = try collectHierarchy(at: url, root: root, includeTopLevelItem: true)
+                let changedWork = try collectHierarchy(
+                    at: url,
+                    root: root,
+                    includeTopLevelItem: true,
+                    exclusionRules: exclusionRules
+                )
                 work.entries.merge(changedWork.entries) { _, new in new }
                 for candidate in changedWork.fileCandidates {
                     if candidate.relativePath != relativePath,
@@ -407,7 +432,7 @@ public actor SnapshotStore {
             }
         }
 
-        for relativePath in ancestors.sorted() where !isExcluded(relativePath) {
+        for relativePath in ancestors.sorted() where !exclusionRules.excludes(relativePath, isDirectory: true) {
             let url = root.appending(path: relativePath)
             guard let indexed = try? indexedNonFileEntry(at: url, root: root),
                   indexed.entry.kind == .directory else { continue }
@@ -417,20 +442,22 @@ public actor SnapshotStore {
         return work
     }
 
-    private func collectHierarchy(at top: URL, root: URL, includeTopLevelItem: Bool) throws -> SnapshotWork {
+    private func collectHierarchy(
+        at top: URL,
+        root: URL,
+        includeTopLevelItem: Bool,
+        exclusionRules: ExclusionRuleSet
+    ) throws -> SnapshotWork {
         var work = SnapshotWork()
         var topInfo: stat?
         if includeTopLevelItem {
             let info = try top.lstatInfo()
             topInfo = info
-            if info.st_mode & mode_t(S_IFMT) != mode_t(S_IFDIR) {
-                try collectItem(at: top, root: root, info: info, work: &work)
-                return work
-            }
-            if excludedDirectoryNames.contains(top.lastPathComponent), top.lastPathComponent != ".git" {
-                return work
-            }
+            let isDirectory = info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+            let relativePath = try top.safeRelativePath(from: root)
+            if exclusionRules.excludes(relativePath, isDirectory: isDirectory) { return work }
             try collectItem(at: top, root: root, info: info, work: &work)
+            if !isDirectory { return work }
         }
 
         if let topInfo, topInfo.st_mode & mode_t(S_IFMT) != mode_t(S_IFDIR) { return work }
@@ -449,10 +476,10 @@ public actor SnapshotStore {
         for case let url as URL in enumerator {
             let info = try url.lstatInfo()
             let fileType = info.st_mode & mode_t(S_IFMT)
-            if fileType == mode_t(S_IFDIR),
-               excludedDirectoryNames.contains(url.lastPathComponent),
-               url.lastPathComponent != ".git" {
-                enumerator.skipDescendants()
+            let isDirectory = fileType == mode_t(S_IFDIR)
+            let relativePath = try url.safeRelativePath(from: root)
+            if exclusionRules.excludes(relativePath, isDirectory: isDirectory) {
+                if isDirectory { enumerator.skipDescendants() }
                 continue
             }
             try collectItem(at: url, root: root, info: info, work: &work)
@@ -515,12 +542,6 @@ public actor SnapshotStore {
             result.append(path)
         }
         return result
-    }
-
-    private func isExcluded(_ relativePath: String) -> Bool {
-        relativePath.split(separator: "/").contains {
-            excludedDirectoryNames.contains(String($0)) && $0 != ".git"
-        }
     }
 
     private func captureFiles(
@@ -921,7 +942,7 @@ private extension Duration {
     }
 }
 
-private extension URL {
+extension URL {
     func safeRelativePath(from root: URL) throws -> String {
         let rootPath = root.standardizedFileURL.path
         let path = standardizedFileURL.path

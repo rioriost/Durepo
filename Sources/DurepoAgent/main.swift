@@ -29,6 +29,7 @@ struct DurepoAgentMain {
 
 private actor AgentCoordinator {
     private let registry: RepositoryRegistry
+    private let exclusionRuleStore: GlobalExclusionRuleStore
     private let store: SnapshotStore
     private var sessions: [UUID: RepositorySession] = [:]
     private var debounceTasks: [UUID: Task<Void, Never>] = [:]
@@ -37,15 +38,17 @@ private actor AgentCoordinator {
 
     init(storageURL: URL) {
         registry = RepositoryRegistry(storageURL: storageURL)
+        exclusionRuleStore = GlobalExclusionRuleStore(storageURL: storageURL)
         store = SnapshotStore(storageURL: storageURL)
     }
 
     func refreshRegistrations() async throws {
         let records = try await registry.records().filter(\.isEnabled)
-        await updateSessions(records)
+        let globalRules = try exclusionRuleStore.rules()
+        await updateSessions(records, globalRules: globalRules)
     }
 
-    private func updateSessions(_ records: [RepositoryRecord]) async {
+    private func updateSessions(_ records: [RepositoryRecord], globalRules: [String]) async {
         let activeIDs = Set(records.map(\.id))
         for id in sessions.keys where !activeIDs.contains(id) {
             sessions.removeValue(forKey: id)
@@ -53,7 +56,15 @@ private actor AgentCoordinator {
             burstStartedAt.removeValue(forKey: id)
         }
 
-        for record in records where sessions[record.id] == nil {
+        for record in records {
+            let exclusionRules = record.effectiveExclusionRules(globalRules: globalRules)
+            let rulesChanged = sessions[record.id].map { $0.exclusionRules != exclusionRules } ?? false
+            guard sessions[record.id] == nil || rulesChanged else { continue }
+            if rulesChanged {
+                sessions.removeValue(forKey: record.id)
+                debounceTasks.removeValue(forKey: record.id)?.cancel()
+                burstStartedAt.removeValue(forKey: record.id)
+            }
             do {
                 let (agentRecord, url) = try await resolveRepository(record)
                 let identity = try repositoryIdentity(at: url)
@@ -65,13 +76,23 @@ private actor AgentCoordinator {
                 let sinceWhen = state.lastCommittedEventID == 0
                     ? FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
                     : FSEventStreamEventId(state.lastCommittedEventID)
-                let watcher = try FSEventWatcher(url: url, sinceWhen: sinceWhen) { [weak self] batch in
+                let watcher = try FSEventWatcher(
+                    url: url,
+                    sinceWhen: sinceWhen,
+                    exclusionRules: exclusionRules
+                ) { [weak self] batch in
                     guard let self else { return }
                     Task { await self.record(batch, for: record.id) }
                 }
-                sessions[record.id] = RepositorySession(record: agentRecord, url: url, watcher: watcher)
+                sessions[record.id] = RepositorySession(
+                    record: agentRecord,
+                    url: url,
+                    exclusionRules: exclusionRules,
+                    watcher: watcher
+                )
                 logger.info("Monitoring \(agentRecord.displayName, privacy: .private)")
-                if state.hasPendingEvents || state.needsFullScan {
+                if rulesChanged { try await store.requireFullScan(repositoryID: record.id) }
+                if state.hasPendingEvents || state.needsFullScan || rulesChanged {
                     Task { [weak self] in await self?.createSnapshot(for: record.id) }
                 }
             } catch {
@@ -176,10 +197,11 @@ private actor AgentCoordinator {
     }
 
     private func createSnapshot(for repositoryID: UUID) async {
-        guard !snapshotting.contains(repositoryID), let session = sessions[repositoryID] else { return }
+        guard !snapshotting.contains(repositoryID), sessions[repositoryID] != nil else { return }
         snapshotting.insert(repositoryID)
         defer { snapshotting.remove(repositoryID) }
         while !Task.isCancelled {
+            guard let session = sessions[repositoryID] else { return }
             do {
                 let state = try await store.monitorState(repositoryID: repositoryID)
                 let targetEventID = state?.lastSeenEventID ?? 0
@@ -192,11 +214,17 @@ private actor AgentCoordinator {
                     repositoryID: session.record.id,
                     reason: .fileSystemEvent,
                     changeSet: changeSet,
+                    exclusionRules: session.exclusionRules,
                     requiresRegisteredRepository: true
                 )
                 let committed = try await store.commitEvents(repositoryID: repositoryID, through: targetEventID)
                 try await store.clearAgentError(repositoryID: repositoryID)
                 logger.info("Created snapshot \(manifest.id.uuidString, privacy: .public) through event \(targetEventID)")
+                if sessions[repositoryID]?.exclusionRules != session.exclusionRules {
+                    try await store.requireFullScan(repositoryID: repositoryID)
+                    logger.info("Exclusion rules changed during snapshot; rescanning \(session.record.displayName, privacy: .private)")
+                    continue
+                }
                 guard committed.hasPendingEvents else { return }
                 logger.info("Changes arrived during snapshot; rescanning \(session.record.displayName, privacy: .private)")
             } catch DurepoError.repositoryNotRegistered {
@@ -241,11 +269,13 @@ private actor AgentCoordinator {
 private final class RepositorySession: @unchecked Sendable {
     let record: RepositoryRecord
     let url: URL
+    let exclusionRules: ExclusionRuleSet
     let watcher: FSEventWatcher
 
-    init(record: RepositoryRecord, url: URL, watcher: FSEventWatcher) {
+    init(record: RepositoryRecord, url: URL, exclusionRules: ExclusionRuleSet, watcher: FSEventWatcher) {
         self.record = record
         self.url = url
+        self.exclusionRules = exclusionRules
         self.watcher = watcher
     }
 
@@ -321,14 +351,16 @@ private final class FSEventWatcher: @unchecked Sendable {
     private var stream: FSEventStreamRef?
     private let onChange: @Sendable (FSEventBatch) -> Void
     private let rootPath: String
-    private let excludedDirectoryNames = DurepoConstants.defaultExcludedDirectoryNames
+    private let exclusionRules: ExclusionRuleSet
 
     init(
         url: URL,
         sinceWhen: FSEventStreamEventId,
+        exclusionRules: ExclusionRuleSet,
         onChange: @escaping @Sendable (FSEventBatch) -> Void
     ) throws {
         self.onChange = onChange
+        self.exclusionRules = exclusionRules
         rootPath = url.standardizedFileURL.path
         var context = FSEventStreamContext(
             version: 0,
@@ -370,10 +402,7 @@ private final class FSEventWatcher: @unchecked Sendable {
         guard path.hasPrefix(rootPath + "/") else { return nil }
         let relative = path.dropFirst(rootPath.count + 1)
         guard !relative.isEmpty else { return "" }
-        let isExcluded = relative.split(separator: "/").contains {
-            excludedDirectoryNames.contains(String($0))
-        }
-        return isExcluded ? nil : String(relative)
+        return exclusionRules.excludes(String(relative)) ? nil : String(relative)
     }
 
     deinit {

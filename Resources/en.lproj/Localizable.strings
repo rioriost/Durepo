@@ -19,6 +19,16 @@
 "No protected repositories" = "No protected repositories";
 "Choose a repository or project folder. Durepo includes its .git directory and uncommitted files." = "Choose a repository or project folder. Durepo includes its .git directory and uncommitted files.";
 "Snapshot Now" = "Snapshot Now";
+"Edit Exclusion Rules" = "Edit Exclusion Rules";
+"Exclusion Rules" = "Exclusion Rules";
+"Exclusion rule" = "Exclusion rule";
+"Default Exclusion Rules" = "Default Exclusion Rules";
+"Add" = "Add";
+"Delete" = "Delete";
+"Save" = "Save";
+"Optimize for Repository" = "Optimize for Repository";
+"Uses .gitignore syntax. Git metadata is always protected." = "Uses .gitignore syntax. Git metadata is always protected.";
+"Uses .gitignore syntax. Repositories inherit these rules until repository-specific rules are saved." = "Uses .gitignore syntax. Repositories inherit these rules until repository-specific rules are saved.";
 "Remove Repository…" = "Remove Repository…";
 "Remove Repository?" = "Remove Repository?";
 "Background protection for this repository will stop. You can retain its deduplicated file data or permanently delete data that no other snapshot uses." = "Background protection for this repository will stop. You can retain its deduplicated file data or permanently delete data that no other snapshot uses.";

@@ -17,6 +17,73 @@ struct SnapshotStoreTests {
         #expect(record.bookmark == Data([1, 2, 3]))
         #expect(record.agentBookmark == nil)
         #expect(record.handoffBookmark == nil)
+        #expect(record.customExclusionRules == nil)
+    }
+
+    @Test("Exclusion rules use gitignore-compatible matching syntax")
+    func gitIgnoreCompatibleExclusionRules() {
+        let rules = ExclusionRuleSet([
+            "# generated files",
+            "*.log",
+            "!/keep.log",
+            "cache/",
+            "generated/**/tmp[0-9].dat",
+            "\\#literal",
+        ])
+
+        #expect(rules.rules.first == "# generated files")
+        #expect(rules.excludes("debug.log"))
+        #expect(!rules.excludes("keep.log"))
+        #expect(rules.excludes("nested/keep.log"))
+        #expect(rules.excludes("cache/file.bin"))
+        #expect(rules.excludes("generated/a/b/tmp7.dat"))
+        #expect(rules.excludes("#literal"))
+        #expect(!rules.excludes("generated/a/b/tmpx.dat"))
+        #expect(!rules.excludes(".git/config"))
+    }
+
+    @Test("Negated rules cannot reinclude a file below an excluded parent")
+    func excludedParentCannotBeReincluded() {
+        let blocked = ExclusionRuleSet(["output/", "!output/keep.txt"])
+        #expect(blocked.excludes("output/keep.txt"))
+
+        let allowed = ExclusionRuleSet(["output/", "!output/", "!output/keep.txt"])
+        #expect(!allowed.excludes("output/keep.txt"))
+    }
+
+    @Test("Global exclusion rules persist including an empty rule list")
+    func globalExclusionRulePersistence() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let store = GlobalExclusionRuleStore(storageURL: fixture.storage)
+
+        #expect(try store.rules() == ExclusionRuleSet.defaults.rules)
+        try store.save(["*.log", "!important.log"])
+        #expect(try store.rules() == ["*.log", "!important.log"])
+        try store.save([])
+        #expect(try store.rules().isEmpty)
+    }
+
+    @Test("Repository optimizer suggests generated paths without importing gitignore")
+    func repositoryExclusionOptimization() async throws {
+        try await withFixture { fixture in
+            try fixture.write("dependency", to: "web/node_modules/package/index.js")
+            try fixture.write("cache", to: ".venv/lib/cache.py")
+            try fixture.write("metadata", to: ".DS_Store")
+            try fixture.write("node_modules/\n", to: ".gitignore")
+
+            let optimizer = RepositoryExclusionOptimizer()
+            let rules = try await optimizer.optimizedRules(
+                repositoryURL: fixture.repository,
+                including: ["*.log"]
+            )
+
+            #expect(rules.first == "*.log")
+            #expect(rules.contains("web/node_modules/"))
+            #expect(rules.contains(".venv/"))
+            #expect(rules.contains(".DS_Store"))
+            #expect(!rules.contains("node_modules/"))
+        }
     }
 
     @Test("Snapshots and restores worktree, .git, and symlinks")
@@ -185,6 +252,28 @@ struct SnapshotStoreTests {
             #expect(state.lastSeenEventID == 42)
             #expect(state.hasPendingEvents)
             #expect(state.needsFullScan)
+        }
+    }
+
+    @Test("Changing exclusion rules requests a full monitor scan")
+    func exclusionRuleChangeRequestsFullScan() async throws {
+        try await withFixture { fixture in
+            let repositoryID = UUID()
+            let store = SnapshotStore(storageURL: fixture.storage)
+            _ = try await store.prepareMonitor(
+                repositoryID: repositoryID,
+                volumeID: "volume-a",
+                rootID: "root-a"
+            )
+            _ = try await store.commitEvents(repositoryID: repositoryID, through: 0)
+
+            try await store.requireFullScan(repositoryID: repositoryID)
+
+            let state = try #require(try await store.monitorState(repositoryID: repositoryID))
+            #expect(state.hasPendingEvents)
+            #expect(state.needsFullScan)
+            let changes = try await store.pendingChangeSet(repositoryID: repositoryID, through: 0)
+            #expect(changes.needsFullScan)
         }
     }
 
@@ -367,6 +456,24 @@ struct SnapshotStoreTests {
             #expect(!manifest.entries.contains { $0.relativePath.hasPrefix("node_modules/") })
             #expect(!manifest.entries.contains { $0.relativePath.hasPrefix("web/dist/") })
             #expect(!manifest.entries.contains { $0.relativePath.hasPrefix(".venv/") })
+        }
+    }
+
+    @Test("A repository-specific rule set replaces the global defaults")
+    func repositorySpecificRulesReplaceDefaults() async throws {
+        try await withFixture { fixture in
+            try fixture.write("secret", to: "private.env")
+            try fixture.write("dependency", to: "node_modules/package/index.js")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let manifest = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: UUID(),
+                reason: .smokeTest,
+                exclusionRules: ExclusionRuleSet(["*.env"])
+            )
+
+            #expect(!manifest.entries.contains { $0.relativePath == "private.env" })
+            #expect(manifest.entries.contains { $0.relativePath == "node_modules/package/index.js" })
         }
     }
 
