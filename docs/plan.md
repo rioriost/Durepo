@@ -13,6 +13,13 @@
 > submission and a physical Mac reboot remain release acceptance checks rather
 > than implementation work.
 
+> Incremental snapshot update (2026-07-17): FSEventsの変更パスとcommit境界を
+> SQLiteへ永続化し、通常イベントは前回のcurrent-entry indexへ対象パスだけを
+> reconcileする。変更ファイルは最大4並列で処理し、同一APFS volumeでは
+> `fclonefileat`で原子的なCoW cloneを固定してからSHA-256を計算する。
+> clone非対応時は4 MiB以下をメモリ、それ以上を1 MiB streamingで保存する。
+> Dropped/MustScan/RootChanged、index不在、manual snapshotはfull scanへ戻る。
+
 ## 0. レビュー後の確定事項
 
 - 最低対応は **macOS 26 Tahoe / Apple Silicon** とする。macOS 27 はベータのため必須にせず、Xcode 27正式版で再検証する。
@@ -20,7 +27,7 @@
 - 監視対象は `NSOpenPanel` でユーザーが明示選択し、GUIとAgentがそれぞれ自分で作成したread-writeのsecurity-scoped bookmarkを保存する。GUIからAgentへは通常のbookmarkで一時的にアクセス権を引き渡し、app-scoped bookmark自体はプロセス間で流用しない。App Groupでは登録情報、CAS、manifestを共有する。
 - Agent実行ファイルはアプリ内の `Contents/Resources`、launchd plistは `Contents/Library/LaunchAgents` に置き、`BundleProgram` と `SMAppService.agent(plistName:)` で登録する。
 - 保存先はApp Group container配下を既定とする。外付け保存先は別途ユーザー選択とbookmarkが必要であり、監視対象配下への保存は禁止する。
-- Durepoは同一ユーザー権限を完全に敵対者とみなす改ざん耐性バックアップではない。Full Disk Accessを持つプロセスやユーザー自身はDurepoデータも削除し得る。1.0では「偶発的誤操作からの高速復旧」を保証範囲とし、外付け/リモート複製を強い保護の将来要件とする。
+- Durepoは同一ユーザー権限を完全に敵対者とみなす改ざん耐性バックアップではない。Full Disk Accessを持つプロセスやユーザー自身はDurepoデータも削除し得る。保証範囲は「AIエージェント等の直近の破壊的操作からの高速復旧」であり、ownCloud/iCloud、外付け複製、リモートrepositoryへのpushによる長期バックアップは製品目的に含めない。
 - 復元は既定で新規ディレクトリへ行い、パスを検証し、同一親ディレクトリ内の一時領域からrenameする。元の場所への上書き復元は、pre-restore snapshotとユーザーの明示確認が実装されるまで提供しない。
 - `.git` の内容は保存するが、復元時の `*.lock` は既定で除外または明示警告する。実行中プロセス由来のロックを忠実に復元するとGitを使用不能にするためである。
 - Mac App Store版はApp Storeの審査工程が同等のセキュリティ検査を含むため、個別のnotarizationは不要。Developer IDによる直接配布物を併設する場合だけHardened Runtime、`notarytool`、stapleを必須とする。
@@ -34,6 +41,7 @@
 - macOS 26: Swift 6.2のstrict concurrencyを有効化し、I/Oはactorへ隔離する。大量のsnapshot表示には改善されたSwiftUI `List`/`Table`を使い、Instruments 26のSwiftUI・Hangs・Time Profilerで測定する。
 - macOS 26: Icon Composer対応の多層アイコンをリリース前に用意する。smoke buildではAppIcon asset catalogと1024px原画を保持する。
 - macOS 26: `Span`/`RawSpan`はコピー・参照カウント削減に有望だが、計測なしにCASハッシュ経路へ導入しない。現在は1 MiBのbounded streaming I/Oを使用する。
+- macOS 26/APFS: 同一volumeでは`fclonefileat`を使い、削除・上書きから独立したfile-level CoW cloneを原子的に固定する。別volumeまたはclone非対応filesystemではbounded copyへfallbackする。
 - macOS 27: Swift Systemの`Stat`、`FilePath.stat()`、`FileDescriptor.stat()`へ、Xcode 27正式版で移行する。現在の`Darwin.lstat/fstat`をavailability付きfallbackとして残す。
 - macOS 27: Swift Executors/System Traceの改善と`@concurrent`を、GUIのMainActorからI/Oを分離できているかの検証に使う。ベータ専用APIを1.0の必須経路にはしない。
 - macOS 27のDiskImageKit/ASIFはVirtualization用途が中心であり、リポジトリCASの代替にはしない。
@@ -606,6 +614,23 @@ FSEventsは変更通知であり、完全な状態データベースではない
 
 ディレクトリ単位の変更やイベント欠落が疑われる場合は、そのディレクトリを再帰的にスキャンする。
 
+実装では、イベントごとの相対パスをSQLite `event_paths`へ保存し、snapshot開始時のevent IDを境界として読み出す。前回確定snapshotの全entryとfingerprintは`current_entries`へ保存する。通常イベントでは対象パスと子孫だけを削除・再走査してmanifest全体を再構成し、未変更entryのCAS hashを再利用する。
+
+変更ファイルの取得経路は以下とする。
+
+```text
+同一APFS volume
+    fclonefileat(source fd → CAS temp)
+    → cloneをSHA-256
+    → CASへrename
+
+clone非対応・別volume
+    4 MiB以下: メモリへ安定読取 → hash → CASに無い場合だけwrite
+    4 MiB超: 1 MiB単位でhash + streaming write
+```
+
+file-level cloneは元ファイル削除後も独立して残るが、repository全体を同一時刻に固定するvolume snapshotではない。snapshot中に到着した後続イベントは未commitのまま残し、次のincremental snapshotでreconcileする。I/Oは最大4ファイルに限定して並列化し、OSLog `snapshot` categoryと`CreateSnapshot` signpostへscan/capture/total時間と取得方式を記録する。
+
 ---
 
 ## 17. 初回スナップショット
@@ -1177,20 +1202,20 @@ MVPではglobから開始する。
 
 ## 33. APFS最適化
 
+実装済み:
+
+- `fclonefileat`によるfile-level copy-on-write clone
+- clone後のSHA-256検証とCAS rename
+- 別volume・非対応filesystemへのmemory/streaming fallback
+- volume UUIDの管理
+
 将来的に以下を検討する。
 
-- APFS clonefile
-- copy-on-write clone
 - sparse file対応
-- volume UUIDの管理
 - file IDによるrename追跡
 - APFS snapshotとの連携
 
-MVPでは通常のCAS方式を優先し、APFS固有最適化は段階的に追加する。
-
-`clonefile`を利用すると、同一ボリューム内では高速かつ省容量なコピーが可能である。
-
-ただし、CAS、外部ストレージ、長期保存との整合性を考慮する必要がある。
+`clonefile`を利用すると、同一ボリューム内では高速かつ省容量に取得でき、元ファイル削除後もcloneが参照するblockは保持される。これは直近の破壊的操作からの復旧というDurepoの目的に適合する。ただしfileごとの原子的取得であり、repository全体のvolume snapshotではない。
 
 ---
 
@@ -1253,7 +1278,7 @@ GUIの差分表示ではrename候補として見せる。
 - GC
 - extended attributes
 - ACL
-- APFS clone最適化
+- APFS cloneのextent/physical-size診断
 - メニューバーUI
 - 診断ツール
 - App Storeによるアップデート

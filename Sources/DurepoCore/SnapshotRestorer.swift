@@ -40,7 +40,10 @@ public actor SnapshotRestorer {
                 let objectURL = await store.objectURL(for: hash)
                 let target = try targetURL(for: entry.relativePath, under: temporaryURL)
                 try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try fileManager.copyItem(at: objectURL, to: target)
+                let flags = copyfile_flags_t(COPYFILE_DATA | COPYFILE_EXCL)
+                guard Darwin.copyfile(objectURL.path, target.path, nil, flags) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
                 try applyMetadata(entry, to: target)
             }
 

@@ -94,7 +94,8 @@ private actor AgentCoordinator {
                 repositoryID: repositoryID,
                 eventID: batch.lastEventID,
                 flags: batch.flags,
-                needsFullScan: batch.needsFullScan
+                needsFullScan: batch.needsFullScan,
+                changedPaths: batch.changedPaths
             )
             scheduleSnapshot(for: repositoryID)
         } catch {
@@ -182,10 +183,15 @@ private actor AgentCoordinator {
             do {
                 let state = try await store.monitorState(repositoryID: repositoryID)
                 let targetEventID = state?.lastSeenEventID ?? 0
+                let changeSet = try await store.pendingChangeSet(
+                    repositoryID: repositoryID,
+                    through: targetEventID
+                )
                 let manifest = try await store.createSnapshot(
                     repositoryURL: session.url,
                     repositoryID: session.record.id,
-                    reason: .fileSystemEvent
+                    reason: .fileSystemEvent,
+                    changeSet: changeSet
                 )
                 let committed = try await store.commitEvents(repositoryID: repositoryID, through: targetEventID)
                 try await store.clearAgentError(repositoryID: repositoryID)
@@ -249,6 +255,7 @@ private struct FSEventBatch: Sendable {
     let lastEventID: UInt64
     let flags: UInt64
     let needsFullScan: Bool
+    let changedPaths: [String]
 }
 
 private let mutationEventFlags: FSEventStreamEventFlags = [
@@ -284,11 +291,17 @@ nonisolated(unsafe) private let durepoFSEventCallback: FSEventStreamCallback = {
     let pathBuffer = eventPaths.assumingMemoryBound(to: UnsafePointer<CChar>?.self)
     var combinedFlags = FSEventStreamEventFlags(0)
     var lastRelevantEventID = FSEventStreamEventId(0)
+    var changedPaths: Set<String> = []
     for index in 0..<eventCount {
         let flag = flagBuffer[index]
         let mustReconcile = flag & fullScanEventFlags != 0
         let path = pathBuffer[index].map(String.init(cString:)) ?? ""
-        guard mustReconcile || !watcher.ignores(path: path) else { continue }
+        if mustReconcile {
+            changedPaths.insert("")
+        } else {
+            guard let relativePath = watcher.relativePath(for: path) else { continue }
+            changedPaths.insert(relativePath)
+        }
         combinedFlags |= flag
         lastRelevantEventID = max(lastRelevantEventID, idBuffer[index])
     }
@@ -296,7 +309,8 @@ nonisolated(unsafe) private let durepoFSEventCallback: FSEventStreamCallback = {
     watcher.deliver(FSEventBatch(
         lastEventID: UInt64(lastRelevantEventID),
         flags: UInt64(combinedFlags),
-        needsFullScan: combinedFlags & fullScanEventFlags != 0
+        needsFullScan: combinedFlags & fullScanEventFlags != 0,
+        changedPaths: changedPaths.sorted()
     ))
 }
 
@@ -348,12 +362,15 @@ private final class FSEventWatcher: @unchecked Sendable {
 
     func deliver(_ batch: FSEventBatch) { onChange(batch) }
 
-    func ignores(path: String) -> Bool {
-        guard path.hasPrefix(rootPath + "/") else { return false }
+    func relativePath(for path: String) -> String? {
+        if path == rootPath { return "" }
+        guard path.hasPrefix(rootPath + "/") else { return nil }
         let relative = path.dropFirst(rootPath.count + 1)
-        return relative.split(separator: "/").contains {
+        guard !relative.isEmpty else { return "" }
+        let isExcluded = relative.split(separator: "/").contains {
             excludedDirectoryNames.contains(String($0))
         }
+        return isExcluded ? nil : String(relative)
     }
 
     deinit {

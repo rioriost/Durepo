@@ -46,10 +46,49 @@ final class SQLiteMetadata {
                 repository_id TEXT NOT NULL,
                 event_id INTEGER NOT NULL,
                 flags INTEGER NOT NULL,
+                needs_full_scan INTEGER NOT NULL DEFAULT 0,
                 received_at REAL NOT NULL
             )
             """)
+        if try !hasColumn("needs_full_scan", in: "event_batches") {
+            try execute("ALTER TABLE event_batches ADD COLUMN needs_full_scan INTEGER NOT NULL DEFAULT 0")
+        }
         try execute("CREATE INDEX IF NOT EXISTS event_batches_repository_event ON event_batches(repository_id, event_id)")
+        try execute("""
+            CREATE TABLE IF NOT EXISTS event_paths (
+                repository_id TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                PRIMARY KEY(repository_id, event_id, relative_path)
+            )
+            """)
+        try execute("CREATE INDEX IF NOT EXISTS event_paths_repository_event ON event_paths(repository_id, event_id)")
+        try execute("""
+            CREATE TABLE IF NOT EXISTS repository_indexes (
+                repository_id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL
+            )
+            """)
+        try execute("""
+            CREATE TABLE IF NOT EXISTS current_entries (
+                repository_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                content_hash TEXT,
+                byte_count INTEGER NOT NULL,
+                posix_mode INTEGER NOT NULL,
+                modified_at REAL,
+                symbolic_link_destination TEXT,
+                device INTEGER,
+                inode INTEGER,
+                file_size INTEGER,
+                mtime_seconds INTEGER,
+                mtime_nanoseconds INTEGER,
+                ctime_seconds INTEGER,
+                ctime_nanoseconds INTEGER,
+                PRIMARY KEY(repository_id, relative_path)
+            )
+            """)
         try execute("""
             CREATE TABLE IF NOT EXISTS agent_errors (
                 repository_id TEXT PRIMARY KEY,
@@ -58,12 +97,131 @@ final class SQLiteMetadata {
                 updated_at REAL NOT NULL
             )
             """)
-        try execute("PRAGMA user_version=2")
+        try execute("PRAGMA user_version=3")
     }
 
     deinit { sqlite3_close(database) }
 
     func index(_ manifest: SnapshotManifest, manifestFile: String) throws {
+        try upsertSnapshot(manifest, manifestFile: manifestFile)
+    }
+
+    func commitSnapshot(
+        _ manifest: SnapshotManifest,
+        manifestFile: String,
+        currentEntries: [IndexedSnapshotEntry]
+    ) throws {
+        try transaction {
+            try upsertSnapshot(manifest, manifestFile: manifestFile)
+            try withStatement("DELETE FROM current_entries WHERE repository_id = ?") { statement in
+                bind(manifest.repositoryID.uuidString, at: 1, in: statement)
+                try stepDone(statement)
+            }
+            try withStatement("""
+                INSERT INTO current_entries(
+                    repository_id, relative_path, kind, content_hash, byte_count, posix_mode,
+                    modified_at, symbolic_link_destination, device, inode, file_size,
+                    mtime_seconds, mtime_nanoseconds, ctime_seconds, ctime_nanoseconds
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """) { statement in
+                    for indexed in currentEntries {
+                        let entry = indexed.entry
+                        bind(manifest.repositoryID.uuidString, at: 1, in: statement)
+                        bind(entry.relativePath, at: 2, in: statement)
+                        bind(entry.kind.rawValue, at: 3, in: statement)
+                        bind(entry.contentHash, at: 4, in: statement)
+                        sqlite3_bind_int64(statement, 5, entry.byteCount)
+                        sqlite3_bind_int64(statement, 6, Int64(entry.posixMode))
+                        bind(entry.modifiedAt?.timeIntervalSince1970, at: 7, in: statement)
+                        bind(entry.symbolicLinkDestination, at: 8, in: statement)
+                        if let fingerprint = indexed.fingerprint {
+                            sqlite3_bind_int64(statement, 9, Int64(bitPattern: fingerprint.device))
+                            sqlite3_bind_int64(statement, 10, Int64(bitPattern: fingerprint.inode))
+                            sqlite3_bind_int64(statement, 11, fingerprint.size)
+                            sqlite3_bind_int64(statement, 12, fingerprint.modificationSeconds)
+                            sqlite3_bind_int64(statement, 13, fingerprint.modificationNanoseconds)
+                            sqlite3_bind_int64(statement, 14, fingerprint.statusSeconds)
+                            sqlite3_bind_int64(statement, 15, fingerprint.statusNanoseconds)
+                        } else {
+                            for index in 9...15 { sqlite3_bind_null(statement, Int32(index)) }
+                        }
+                        try stepDone(statement)
+                        sqlite3_reset(statement)
+                        sqlite3_clear_bindings(statement)
+                    }
+                }
+            try withStatement("""
+                INSERT INTO repository_indexes(repository_id, snapshot_id) VALUES(?, ?)
+                ON CONFLICT(repository_id) DO UPDATE SET snapshot_id=excluded.snapshot_id
+                """) { statement in
+                    bind(manifest.repositoryID.uuidString, at: 1, in: statement)
+                    bind(manifest.id.uuidString, at: 2, in: statement)
+                    try stepDone(statement)
+                }
+        }
+    }
+
+    func currentEntries(repositoryID: UUID) throws -> [String: IndexedSnapshotEntry]? {
+        let hasIndex = try withStatement("SELECT 1 FROM repository_indexes WHERE repository_id = ?") { statement in
+            bind(repositoryID.uuidString, at: 1, in: statement)
+            return sqlite3_step(statement) == SQLITE_ROW
+        }
+        guard hasIndex else { return nil }
+
+        return try withStatement("""
+            SELECT relative_path, kind, content_hash, byte_count, posix_mode, modified_at,
+                symbolic_link_destination, device, inode, file_size, mtime_seconds,
+                mtime_nanoseconds, ctime_seconds, ctime_nanoseconds
+            FROM current_entries WHERE repository_id = ?
+            """) { statement in
+                bind(repositoryID.uuidString, at: 1, in: statement)
+                var result: [String: IndexedSnapshotEntry] = [:]
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    let relativePath = text(statement, 0)
+                    guard let kind = SnapshotEntryKind(rawValue: text(statement, 1)) else { continue }
+                    let entry = SnapshotEntry(
+                        relativePath: relativePath,
+                        kind: kind,
+                        contentHash: optionalText(statement, 2),
+                        byteCount: sqlite3_column_int64(statement, 3),
+                        posixMode: UInt32(clamping: sqlite3_column_int64(statement, 4)),
+                        modifiedAt: optionalDouble(statement, 5).map(Date.init(timeIntervalSince1970:)),
+                        symbolicLinkDestination: optionalText(statement, 6)
+                    )
+                    let fingerprint: FileFingerprint?
+                    if sqlite3_column_type(statement, 7) == SQLITE_NULL {
+                        fingerprint = nil
+                    } else {
+                        fingerprint = FileFingerprint(
+                            device: UInt64(bitPattern: sqlite3_column_int64(statement, 7)),
+                            inode: UInt64(bitPattern: sqlite3_column_int64(statement, 8)),
+                            size: sqlite3_column_int64(statement, 9),
+                            modificationSeconds: sqlite3_column_int64(statement, 10),
+                            modificationNanoseconds: sqlite3_column_int64(statement, 11),
+                            statusSeconds: sqlite3_column_int64(statement, 12),
+                            statusNanoseconds: sqlite3_column_int64(statement, 13)
+                        )
+                    }
+                    result[relativePath] = IndexedSnapshotEntry(entry: entry, fingerprint: fingerprint)
+                }
+                return result
+            }
+    }
+
+    func invalidateCurrentIndex(repositoryID: UUID) throws {
+        try transaction {
+            try withStatement("DELETE FROM current_entries WHERE repository_id = ?") { statement in
+                bind(repositoryID.uuidString, at: 1, in: statement)
+                try stepDone(statement)
+            }
+            try withStatement("DELETE FROM repository_indexes WHERE repository_id = ?") { statement in
+                bind(repositoryID.uuidString, at: 1, in: statement)
+                try stepDone(statement)
+            }
+        }
+    }
+
+    private func upsertSnapshot(_ manifest: SnapshotManifest, manifestFile: String) throws {
         try withStatement("""
             INSERT INTO snapshots(id, repository_id, repository_name, created_at, reason, manifest_file, file_count, logical_byte_count)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?)
@@ -174,34 +332,62 @@ final class SQLiteMetadata {
 
     func prepareMonitor(repositoryID: UUID, volumeID: String, rootID: String) throws -> RepositoryMonitorState {
         let existing = try monitorState(repositoryID: repositoryID)
-        if let identity = try monitorIdentity(repositoryID: repositoryID),
+        let previousIdentity = try monitorIdentity(repositoryID: repositoryID)
+        if let identity = previousIdentity,
            identity.volumeID == volumeID, identity.rootID == rootID {
             return existing ?? RepositoryMonitorState(lastSeenEventID: 0, lastCommittedEventID: 0, hasPendingEvents: true, needsFullScan: true)
         }
-        try withStatement("""
-            INSERT INTO monitor_state(repository_id, volume_id, root_id, last_seen_event_id, last_committed_event_id, pending, needs_full_scan, updated_at)
-            VALUES(?, ?, ?, 0, 0, 1, 1, ?)
-            ON CONFLICT(repository_id) DO UPDATE SET volume_id=excluded.volume_id, root_id=excluded.root_id,
-                last_seen_event_id=0, last_committed_event_id=0, pending=1, needs_full_scan=1, updated_at=excluded.updated_at
-            """) { statement in
-                bind(repositoryID.uuidString, at: 1, in: statement)
-                bind(volumeID, at: 2, in: statement)
-                bind(rootID, at: 3, in: statement)
-                sqlite3_bind_double(statement, 4, Date().timeIntervalSince1970)
-                try stepDone(statement)
+        try transaction {
+            var tables = ["event_paths", "event_batches"]
+            if previousIdentity != nil { tables += ["current_entries", "repository_indexes"] }
+            for table in tables {
+                try withStatement("DELETE FROM \(table) WHERE repository_id = ?") { statement in
+                    bind(repositoryID.uuidString, at: 1, in: statement)
+                    try stepDone(statement)
+                }
+            }
+            try withStatement("""
+                INSERT INTO monitor_state(repository_id, volume_id, root_id, last_seen_event_id, last_committed_event_id, pending, needs_full_scan, updated_at)
+                VALUES(?, ?, ?, 0, 0, 1, 1, ?)
+                ON CONFLICT(repository_id) DO UPDATE SET volume_id=excluded.volume_id, root_id=excluded.root_id,
+                    last_seen_event_id=0, last_committed_event_id=0, pending=1, needs_full_scan=1, updated_at=excluded.updated_at
+                """) { statement in
+                    bind(repositoryID.uuidString, at: 1, in: statement)
+                    bind(volumeID, at: 2, in: statement)
+                    bind(rootID, at: 3, in: statement)
+                    sqlite3_bind_double(statement, 4, Date().timeIntervalSince1970)
+                    try stepDone(statement)
+                }
             }
         return RepositoryMonitorState(lastSeenEventID: 0, lastCommittedEventID: 0, hasPendingEvents: true, needsFullScan: true)
     }
 
-    func recordEvent(repositoryID: UUID, eventID: UInt64, flags: UInt64, needsFullScan: Bool) throws {
+    func recordEvent(
+        repositoryID: UUID,
+        eventID: UInt64,
+        flags: UInt64,
+        needsFullScan: Bool,
+        changedPaths: [String]
+    ) throws {
         let event = Int64(clamping: eventID)
         try transaction {
-            try withStatement("INSERT INTO event_batches(repository_id, event_id, flags, received_at) VALUES(?, ?, ?, ?)") { statement in
+            try withStatement("INSERT INTO event_batches(repository_id, event_id, flags, needs_full_scan, received_at) VALUES(?, ?, ?, ?, ?)") { statement in
                 bind(repositoryID.uuidString, at: 1, in: statement)
                 sqlite3_bind_int64(statement, 2, event)
                 sqlite3_bind_int64(statement, 3, Int64(bitPattern: flags))
-                sqlite3_bind_double(statement, 4, Date().timeIntervalSince1970)
+                sqlite3_bind_int(statement, 4, needsFullScan ? 1 : 0)
+                sqlite3_bind_double(statement, 5, Date().timeIntervalSince1970)
                 try stepDone(statement)
+            }
+            try withStatement("INSERT OR IGNORE INTO event_paths(repository_id, event_id, relative_path) VALUES(?, ?, ?)") { statement in
+                for path in Set(changedPaths) {
+                    bind(repositoryID.uuidString, at: 1, in: statement)
+                    sqlite3_bind_int64(statement, 2, event)
+                    bind(path, at: 3, in: statement)
+                    try stepDone(statement)
+                    sqlite3_reset(statement)
+                    sqlite3_clear_bindings(statement)
+                }
             }
             try withStatement("""
                 UPDATE monitor_state SET last_seen_event_id = MAX(last_seen_event_id, ?), pending = 1,
@@ -214,6 +400,37 @@ final class SQLiteMetadata {
                     try stepDone(statement)
                 }
         }
+    }
+
+    func pendingChangeSet(repositoryID: UUID, through eventID: UInt64) throws -> SnapshotChangeSet {
+        let event = Int64(clamping: eventID)
+        let committed = Int64(clamping: try monitorState(repositoryID: repositoryID)?.lastCommittedEventID ?? 0)
+        let needsFullScan = try withStatement("""
+            SELECT COALESCE(MAX(needs_full_scan), 0) FROM event_batches
+            WHERE repository_id = ? AND event_id > ? AND event_id <= ?
+            """) { statement in
+                bind(repositoryID.uuidString, at: 1, in: statement)
+                sqlite3_bind_int64(statement, 2, committed)
+                sqlite3_bind_int64(statement, 3, event)
+                guard sqlite3_step(statement) == SQLITE_ROW else { return true }
+                return sqlite3_column_int(statement, 0) != 0
+            }
+        let paths = try withStatement("""
+            SELECT DISTINCT relative_path FROM event_paths
+            WHERE repository_id = ? AND event_id > ? AND event_id <= ?
+            ORDER BY relative_path
+            """) { statement in
+                bind(repositoryID.uuidString, at: 1, in: statement)
+                sqlite3_bind_int64(statement, 2, committed)
+                sqlite3_bind_int64(statement, 3, event)
+                var result: [String] = []
+                while sqlite3_step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
+                return result
+            }
+        return SnapshotChangeSet(
+            changedPaths: paths,
+            needsFullScan: needsFullScan || paths.isEmpty || paths.contains("")
+        )
     }
 
     func monitorState(repositoryID: UUID) throws -> RepositoryMonitorState? {
@@ -235,6 +452,11 @@ final class SQLiteMetadata {
     func commitEvents(repositoryID: UUID, through eventID: UInt64) throws -> RepositoryMonitorState {
         let event = Int64(clamping: eventID)
         return try transaction {
+            try withStatement("DELETE FROM event_paths WHERE repository_id = ? AND event_id <= ?") { statement in
+                bind(repositoryID.uuidString, at: 1, in: statement)
+                sqlite3_bind_int64(statement, 2, event)
+                try stepDone(statement)
+            }
             try withStatement("DELETE FROM event_batches WHERE repository_id = ? AND event_id <= ?") { statement in
                 bind(repositoryID.uuidString, at: 1, in: statement)
                 sqlite3_bind_int64(statement, 2, event)
@@ -296,6 +518,15 @@ final class SQLiteMetadata {
         }
     }
 
+    private func hasColumn(_ column: String, in table: String) throws -> Bool {
+        try withStatement("PRAGMA table_info(\(table))") { statement in
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if text(statement, 1) == column { return true }
+            }
+            return false
+        }
+    }
+
     private func transaction<T>(_ operation: () throws -> T) throws -> T {
         try execute("BEGIN IMMEDIATE")
         do {
@@ -323,9 +554,35 @@ final class SQLiteMetadata {
         sqlite3_bind_text(statement, index, value, -1, Self.transient)
     }
 
+    private func bind(_ value: String?, at index: Int32, in statement: OpaquePointer) {
+        if let value {
+            bind(value, at: index, in: statement)
+        } else {
+            sqlite3_bind_null(statement, index)
+        }
+    }
+
+    private func bind(_ value: Double?, at index: Int32, in statement: OpaquePointer) {
+        if let value {
+            sqlite3_bind_double(statement, index, value)
+        } else {
+            sqlite3_bind_null(statement, index)
+        }
+    }
+
     private func text(_ statement: OpaquePointer, _ index: Int32) -> String {
         guard let value = sqlite3_column_text(statement, index) else { return "" }
         return String(cString: value)
+    }
+
+    private func optionalText(_ statement: OpaquePointer, _ index: Int32) -> String? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
+        return text(statement, index)
+    }
+
+    private func optionalDouble(_ statement: OpaquePointer, _ index: Int32) -> Double? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
+        return sqlite3_column_double(statement, index)
     }
 
     private func stepDone(_ statement: OpaquePointer) throws {

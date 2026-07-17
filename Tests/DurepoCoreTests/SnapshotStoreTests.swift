@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 @testable import DurepoCore
@@ -125,6 +126,153 @@ struct SnapshotStoreTests {
         }
     }
 
+    @Test("Incremental snapshots reuse unchanged files and capture only dirty paths")
+    func incrementalSnapshot() async throws {
+        try await withFixture { fixture in
+            let repositoryID = UUID()
+            try fixture.write("unchanged", to: "stable.txt")
+            try fixture.write("before", to: "changed.txt")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let initial = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .initial
+            )
+            let stableHash = try #require(initial.entries.first { $0.relativePath == "stable.txt" }?.contentHash)
+
+            _ = try await store.prepareMonitor(repositoryID: repositoryID, volumeID: "volume-a", rootID: "root-a")
+            _ = try await store.commitEvents(repositoryID: repositoryID, through: 0)
+            #expect(Darwin.chmod(fixture.repository.appending(path: "stable.txt").path, 0) == 0)
+            try fixture.write("after", to: "changed.txt")
+            try await store.recordEvent(
+                repositoryID: repositoryID,
+                eventID: 1,
+                flags: 1,
+                needsFullScan: false,
+                changedPaths: ["changed.txt"]
+            )
+            let changes = try await store.pendingChangeSet(repositoryID: repositoryID, through: 1)
+            #expect(changes == SnapshotChangeSet(changedPaths: ["changed.txt"], needsFullScan: false))
+
+            let incremental = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .fileSystemEvent,
+                changeSet: changes
+            )
+            #expect(incremental.entries.first { $0.relativePath == "stable.txt" }?.contentHash == stableHash)
+            let changedHash = incremental.entries.first { $0.relativePath == "changed.txt" }?.contentHash
+            #expect(changedHash != initial.entries.first { $0.relativePath == "changed.txt" }?.contentHash)
+        }
+    }
+
+    @Test("Incremental directory deletion removes every descendant")
+    func incrementalDirectoryDeletion() async throws {
+        try await withFixture { fixture in
+            let repositoryID = UUID()
+            try fixture.write("one", to: "bulk/one.txt")
+            try fixture.write("two", to: "bulk/nested/two.txt")
+            try fixture.write("keep", to: "keep.txt")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            _ = try await store.prepareMonitor(repositoryID: repositoryID, volumeID: "volume-a", rootID: "root-a")
+            _ = try await store.commitEvents(repositoryID: repositoryID, through: 0)
+            _ = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .initial
+            )
+
+            try FileManager.default.removeItem(at: fixture.repository.appending(path: "bulk"))
+            try await store.recordEvent(
+                repositoryID: repositoryID,
+                eventID: 2,
+                flags: 1,
+                needsFullScan: false,
+                changedPaths: ["bulk"]
+            )
+            let changes = try await store.pendingChangeSet(repositoryID: repositoryID, through: 2)
+            let afterDeletion = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .fileSystemEvent,
+                changeSet: changes
+            )
+            #expect(!afterDeletion.entries.contains { $0.relativePath == "bulk" || $0.relativePath.hasPrefix("bulk/") })
+            #expect(afterDeletion.entries.contains { $0.relativePath == "keep.txt" })
+        }
+    }
+
+    @Test("Pending dirty paths survive a store restart")
+    func dirtyPathPersistence() async throws {
+        try await withFixture { fixture in
+            let repositoryID = UUID()
+            let store = SnapshotStore(storageURL: fixture.storage)
+            _ = try await store.prepareMonitor(repositoryID: repositoryID, volumeID: "volume-a", rootID: "root-a")
+            _ = try await store.commitEvents(repositoryID: repositoryID, through: 0)
+            try await store.recordEvent(
+                repositoryID: repositoryID,
+                eventID: 7,
+                flags: 1,
+                needsFullScan: false,
+                changedPaths: ["Sources/main.swift", ".git/HEAD"]
+            )
+
+            let restarted = SnapshotStore(storageURL: fixture.storage)
+            let changes = try await restarted.pendingChangeSet(repositoryID: repositoryID, through: 7)
+            #expect(changes.changedPaths == [".git/HEAD", "Sources/main.swift"])
+            #expect(!changes.needsFullScan)
+        }
+    }
+
+    @Test("APFS-cloned objects survive source deletion")
+    func cloneSurvivesSourceDeletion() async throws {
+        try await withFixture { fixture in
+            let contents = String(repeating: "0123456789abcdef", count: 65_536)
+            try fixture.write(contents, to: "large.bin")
+            let source = fixture.repository.appending(path: "large.bin")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let manifest = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: UUID(),
+                reason: .smokeTest
+            )
+            let hash = try #require(manifest.entries.first { $0.relativePath == "large.bin" }?.contentHash)
+            let object = await store.objectURL(for: hash)
+            let sourceIdentifier = try source.resourceValues(forKeys: [.fileContentIdentifierKey]).fileContentIdentifier
+            let objectIdentifier = try object.resourceValues(forKeys: [.fileContentIdentifierKey]).fileContentIdentifier
+            #expect(String(describing: sourceIdentifier) == String(describing: objectIdentifier))
+
+            try FileManager.default.removeItem(at: source)
+            try await store.verify(manifest)
+            let restorer = SnapshotRestorer(store: store)
+            _ = try await restorer.restore(manifest, to: fixture.restore)
+            #expect(try String(contentsOf: fixture.restore.appending(path: "large.bin"), encoding: .utf8) == contents)
+        }
+    }
+
+    @Test("Memory and streaming fallbacks preserve data without clone support")
+    func copyFallbacks() async throws {
+        try await withFixture { fixture in
+            try fixture.write("small", to: "small.txt")
+            try fixture.write(String(repeating: "large", count: 1_000), to: "large.txt")
+            let store = SnapshotStore(
+                storageURL: fixture.storage,
+                maxConcurrentFileOperations: 4,
+                smallFileThreshold: 16,
+                cloneFilesWhenSupported: false
+            )
+            let manifest = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: UUID(),
+                reason: .smokeTest
+            )
+            let restorer = SnapshotRestorer(store: store)
+            _ = try await restorer.restore(manifest, to: fixture.restore)
+            #expect(try String(contentsOf: fixture.restore.appending(path: "small.txt"), encoding: .utf8) == "small")
+            #expect(try String(contentsOf: fixture.restore.appending(path: "large.txt"), encoding: .utf8) == String(repeating: "large", count: 1_000))
+        }
+    }
+
     @Test("Agent health errors persist until cleared")
     func agentHealthPersistence() async throws {
         try await withFixture { fixture in
@@ -205,9 +353,10 @@ struct SnapshotStoreTests {
         }
     }
 
-    @Test("A ten-thousand-file deletion is captured by the next full snapshot")
+    @Test("A ten-thousand-file deletion is captured incrementally")
     func tenThousandFileDeletion() async throws {
         try await withFixture { fixture in
+            let repositoryID = UUID()
             let bulk = fixture.repository.appending(path: "bulk")
             try FileManager.default.createDirectory(at: bulk, withIntermediateDirectories: true)
             for index in 0..<10_000 {
@@ -215,17 +364,32 @@ struct SnapshotStoreTests {
                 #expect(FileManager.default.createFile(atPath: url.path, contents: Data("x".utf8)))
             }
             let store = SnapshotStore(storageURL: fixture.storage)
+            _ = try await store.prepareMonitor(repositoryID: repositoryID, volumeID: "volume-a", rootID: "root-a")
+            _ = try await store.commitEvents(repositoryID: repositoryID, through: 0)
             let initial = try await store.createSnapshot(
                 repositoryURL: fixture.repository,
-                repositoryID: UUID(),
+                repositoryID: repositoryID,
                 reason: .smokeTest
             )
             #expect(initial.fileCount == 10_000)
-            try FileManager.default.removeItem(at: bulk)
+            let deletedPaths = (0..<10_000).map { "bulk/\($0).txt" }
+            for path in deletedPaths {
+                try FileManager.default.removeItem(at: fixture.repository.appending(path: path))
+            }
+            try await store.recordEvent(
+                repositoryID: repositoryID,
+                eventID: 10_000,
+                flags: 1,
+                needsFullScan: false,
+                changedPaths: deletedPaths
+            )
+            let changes = try await store.pendingChangeSet(repositoryID: repositoryID, through: 10_000)
+            #expect(!changes.needsFullScan)
             let afterDeletion = try await store.createSnapshot(
                 repositoryURL: fixture.repository,
                 repositoryID: initial.repositoryID,
-                reason: .fileSystemEvent
+                reason: .fileSystemEvent,
+                changeSet: changes
             )
             #expect(afterDeletion.fileCount == 0)
         }
