@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -5,7 +6,7 @@ struct DurepoApp: App {
     @State private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("Durepo", id: "main") {
             ContentView(model: model)
                 .frame(minWidth: 860, minHeight: 560)
                 .task { await model.run() }
@@ -24,5 +25,30 @@ struct DurepoApp: App {
                 .frame(width: 460)
                 .padding(20)
         }
+
+
+        MenuBarExtra("Durepo", systemImage: "externaldrive.badge.shield.half.filled") {
+            DurepoMenuBarView(model: model)
+        }
+    }
+}
+
+private struct DurepoMenuBarView: View {
+    @Bindable var model: AppModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Open Durepo") {
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        Button("Snapshot All Now") {
+            Task { await model.createSnapshotsForAllRepositories() }
+        }
+        .disabled(model.isBusy || model.repositories.isEmpty)
+        Divider()
+        SettingsLink { Text("Settings…") }
+        Divider()
+        Button("Quit Durepo") { NSApp.terminate(nil) }
     }
 }

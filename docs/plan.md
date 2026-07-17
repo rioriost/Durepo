@@ -13,6 +13,16 @@
 > submission and a physical Mac reboot remain release acceptance checks rather
 > than implementation work.
 
+> Version 1.0 implementation status (2026-07-17): complete as a release
+> candidate. Destructive-change protection, paginated diff and selective
+> restore, pre-restore snapshots with rollback-safe in-place replacement,
+> hard-link/sparse/xattr/ACL fidelity, capacity retention, safe GC, scheduled
+> integrity diagnostics, menu-bar controls, and local diagnostic export are
+> implemented. The automated suite covers 10,000-file deletion, corruption,
+> metadata fidelity, retention, and restore safety. App Store Connect upload,
+> physical reboot acceptance, and optional Icon Composer conversion remain
+> release operations rather than code implementation.
+
 > Incremental snapshot update (2026-07-17): FSEventsの変更パスとcommit境界を
 > SQLiteへ永続化し、通常イベントは前回のcurrent-entry indexへ対象パスだけを
 > reconcileする。変更ファイルは最大4並列で処理し、同一APFS volumeでは
@@ -28,7 +38,7 @@
 - Agent実行ファイルはアプリ内の `Contents/Resources`、launchd plistは `Contents/Library/LaunchAgents` に置き、`BundleProgram` と `SMAppService.agent(plistName:)` で登録する。
 - 保存先はApp Group container配下を既定とする。外付け保存先は別途ユーザー選択とbookmarkが必要であり、監視対象配下への保存は禁止する。
 - Durepoは同一ユーザー権限を完全に敵対者とみなす改ざん耐性バックアップではない。Full Disk Accessを持つプロセスやユーザー自身はDurepoデータも削除し得る。保証範囲は「AIエージェント等の直近の破壊的操作からの高速復旧」であり、ownCloud/iCloud、外付け複製、リモートrepositoryへのpushによる長期バックアップは製品目的に含めない。
-- 復元は既定で新規ディレクトリへ行い、パスを検証し、同一親ディレクトリ内の一時領域からrenameする。元の場所への上書き復元は、pre-restore snapshotとユーザーの明示確認が実装されるまで提供しない。
+- 復元は既定で新規ディレクトリへ行い、パスを検証し、同一親ディレクトリ内の一時領域からrenameする。元の場所への復元は、pre-restore snapshot、ユーザーの明示確認、同一親でのstaging、失敗時rollback、自己イベント抑制を必須とする（実装済み）。
 - `.git` の内容は保存するが、復元時の `*.lock` は既定で除外または明示警告する。実行中プロセス由来のロックを忠実に復元するとGitを使用不能にするためである。
 - Mac App Store版はApp Storeの審査工程が同等のセキュリティ検査を含むため、個別のnotarizationは不要。Developer IDによる直接配布物を併設する場合だけHardened Runtime、`notarytool`、stapleを必須とする。
 - アプリ内自動アップデータはMac App Store版に含めない。更新はApp Storeに委ねる。

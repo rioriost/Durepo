@@ -19,6 +19,7 @@ public actor SnapshotStore {
     private let maxConcurrentFileOperations: Int
     private let smallFileThreshold: Int64
     private let cloneFilesWhenSupported: Bool
+    private let maximumStorageByteCount: Int64
     private var metadata: SQLiteMetadata?
     private var didReconcileMetadata = false
     private var didCleanTemporaryFiles = false
@@ -31,7 +32,8 @@ public actor SnapshotStore {
         staleTemporaryAge: TimeInterval = 3_600,
         maxConcurrentFileOperations: Int = 4,
         smallFileThreshold: Int64 = 4 * 1_048_576,
-        cloneFilesWhenSupported: Bool = true
+        cloneFilesWhenSupported: Bool = true,
+        maximumStorageByteCount: Int64 = 50 * 1_073_741_824
     ) {
         self.storageURL = storageURL.standardizedFileURL
         self.objectsURL = storageURL.appending(path: "objects", directoryHint: .isDirectory)
@@ -45,6 +47,7 @@ public actor SnapshotStore {
         self.maxConcurrentFileOperations = max(1, min(4, maxConcurrentFileOperations))
         self.smallFileThreshold = min(max(0, smallFileThreshold), 64 * 1_048_576)
         self.cloneFilesWhenSupported = cloneFilesWhenSupported
+        self.maximumStorageByteCount = max(1_048_576, maximumStorageByteCount)
     }
 
     public func prepare() throws {
@@ -70,6 +73,7 @@ public actor SnapshotStore {
         reason: SnapshotReason,
         changeSet: SnapshotChangeSet? = nil,
         exclusionRules: ExclusionRuleSet? = nil,
+        detectAnomalies: Bool = false,
         requiresRegisteredRepository: Bool = false,
         progress: (@Sendable (SnapshotProgress) -> Void)? = nil
     ) async throws -> SnapshotManifest {
@@ -99,7 +103,8 @@ public actor SnapshotStore {
 
         let requestedIncremental = reason == .fileSystemEvent && changeSet?.needsFullScan == false
         let effectiveExclusionRules = exclusionRules ?? defaultExclusionRules
-        let cachedEntries = requestedIncremental ? try metadataStore.currentEntries(repositoryID: repositoryID) : nil
+        let previousEntries = try metadataStore.currentEntries(repositoryID: repositoryID)
+        let cachedEntries = requestedIncremental ? previousEntries : nil
         let usesFullScan = !requestedIncremental || cachedEntries == nil
         let scanStartedAt = ContinuousClock.now
         var work: SnapshotWork
@@ -119,6 +124,8 @@ public actor SnapshotStore {
             )
         }
         let scanDuration = scanStartedAt.duration(to: .now)
+        let candidateBytes = work.fileCandidates.reduce(Int64(0)) { $0 + $1.fingerprint.size }
+        try ensureStorageCapacity(for: candidateBytes)
         let captureStartedAt = ContinuousClock.now
         let captured = try await captureFiles(work.fileCandidates, progress: progress)
         let captureDuration = captureStartedAt.duration(to: .now)
@@ -127,6 +134,9 @@ public actor SnapshotStore {
         }
 
         let indexedEntries = work.entries.values.sorted { $0.entry.relativePath < $1.entry.relativePath }
+        let anomaly = detectAnomalies
+            ? Self.detectAnomaly(previousEntries: previousEntries, currentEntries: indexedEntries)
+            : nil
 
         let manifest = SnapshotManifest(
             repositoryID: repositoryID,
@@ -140,9 +150,11 @@ public actor SnapshotStore {
         try metadataStore.commitSnapshot(
             manifest,
             manifestFile: manifestURL.lastPathComponent,
-            currentEntries: indexedEntries
+            currentEntries: indexedEntries,
+            anomaly: anomaly
         )
         try applyRetention(to: repositoryID)
+        try applyCapacityRetention()
 
         let totalDuration = startedAt.duration(to: .now)
         let clones = captured.lazy.filter { $0.method == .clone }.count
@@ -157,6 +169,16 @@ public actor SnapshotStore {
     public func snapshotSummaries(repositoryID: UUID? = nil, limit: Int = 200) throws -> [SnapshotSummary] {
         try prepare()
         return try metadataStore.summaries(repositoryID: repositoryID, limit: max(1, limit))
+    }
+
+    public func snapshotDiff(id: UUID, offset: Int = 0, limit: Int = 500) throws -> SnapshotDiffPage {
+        try prepare()
+        return try metadataStore.snapshotDiff(snapshotID: id, offset: offset, limit: limit)
+    }
+
+    public func snapshotEntries(id: UUID, offset: Int = 0, limit: Int = 500) throws -> SnapshotDiffPage {
+        try prepare()
+        return try metadataStore.snapshotEntries(snapshotID: id, offset: offset, limit: limit)
     }
 
     public func manifest(id: UUID) throws -> SnapshotManifest {
@@ -289,11 +311,79 @@ public actor SnapshotStore {
         return try metadataStore.agentHealth()
     }
 
+    public func protectionAlerts(includeAcknowledged: Bool = false) throws -> [ProtectionAlert] {
+        try prepare()
+        return try metadataStore.protectionAlerts(includeAcknowledged: includeAcknowledged)
+    }
+
+    public func acknowledgeProtectionAlert(id: UUID) throws {
+        try prepare()
+        try metadataStore.acknowledgeProtectionAlert(id: id)
+    }
+
+    public func setSnapshotProtected(id: UUID, isProtected: Bool) throws {
+        try prepare()
+        try metadataStore.setSnapshotProtected(id: id, isProtected: isProtected)
+    }
+
+    public func hasRestoreSuppression(repositoryID: UUID) throws -> Bool {
+        try prepare()
+        return try metadataStore.hasRestoreSuppression(repositoryID: repositoryID)
+    }
+
+    public func clearRestoreSuppression(repositoryID: UUID) throws {
+        try prepare()
+        try metadataStore.clearRestoreSuppression(repositoryID: repositoryID)
+    }
+
+    public func restoreInPlace(
+        snapshotID: UUID,
+        repositoryURL: URL,
+        repositoryID: UUID,
+        exclusionRules: ExclusionRuleSet,
+        requiresRegisteredRepository: Bool = false
+    ) async throws -> InPlaceRestoreResult {
+        if try hasGitLockFile(in: repositoryURL) {
+            throw DurepoError.gitOperationInProgress
+        }
+        let targetManifest = try manifest(id: snapshotID)
+        guard targetManifest.repositoryID == repositoryID else {
+            throw DurepoError.invalidRepository(repositoryURL.path)
+        }
+        try verify(targetManifest)
+        try metadataStore.setSnapshotProtected(id: snapshotID, isProtected: true)
+        let preRestoreSnapshot = try await createSnapshot(
+            repositoryURL: repositoryURL,
+            repositoryID: repositoryID,
+            reason: .preRestore,
+            exclusionRules: exclusionRules,
+            requiresRegisteredRepository: requiresRegisteredRepository
+        )
+        let restoredURL = try await SnapshotRestorer(store: self)
+            .replaceExistingDirectory(with: targetManifest, at: repositoryURL)
+        try metadataStore.markRestoreCompleted(repositoryID: repositoryID)
+        try metadataStore.requireFullScan(repositoryID: repositoryID)
+        return InPlaceRestoreResult(restoredURL: restoredURL, preRestoreSnapshot: preRestoreSnapshot)
+    }
+
+    @discardableResult
+    public func recordProtectionAlert(
+        repositoryID: UUID,
+        anomaly: RepositoryAnomaly
+    ) throws -> ProtectionAlert {
+        try prepare()
+        return try metadataStore.recordProtectionAlert(repositoryID: repositoryID, anomaly: anomaly)
+    }
+
     public func verify(_ manifest: SnapshotManifest) throws {
         guard manifest.formatVersion == DurepoConstants.formatVersion else {
             throw DurepoError.unsupportedFormat(manifest.formatVersion)
         }
-        for entry in manifest.entries where entry.kind == .file {
+        try verify(entries: manifest.entries)
+    }
+
+    public func verify(entries: [SnapshotEntry]) throws {
+        for entry in entries where entry.kind == .file {
             guard let hash = entry.contentHash else {
                 throw DurepoError.missingObject(entry.relativePath)
             }
@@ -313,6 +403,102 @@ public actor SnapshotStore {
             .appending(path: hash)
     }
 
+    public func checkIntegrity(deep: Bool = true) throws -> StoreIntegrityReport {
+        try prepare()
+        let lockDescriptor = try acquireExclusiveStoreLock()
+        defer { releaseStoreLock(lockDescriptor) }
+
+        var issues: [IntegrityIssue] = []
+        let databaseMessages = try metadataStore.integrityMessages()
+        for message in databaseMessages where message.lowercased() != "ok" {
+            issues.append(IntegrityIssue(severity: .error, message: "SQLite: \(message)"))
+        }
+
+        let manifestURLs = try fileManager.contentsOfDirectory(at: manifestsURL, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+        var referencedHashes: Set<String> = []
+        for url in manifestURLs {
+            let manifest: SnapshotManifest
+            do {
+                manifest = try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+            } catch {
+                issues.append(IntegrityIssue(severity: .error, message: "Corrupt manifest: \(url.lastPathComponent)"))
+                continue
+            }
+            for message in Self.manifestPathIssues(manifest.entries) {
+                issues.append(IntegrityIssue(
+                    severity: .error,
+                    message: "Unsafe manifest \(url.lastPathComponent): \(message)"
+                ))
+            }
+            for entry in manifest.entries where entry.kind == .file {
+                guard let hash = entry.contentHash, Self.isValidContentHash(hash) else {
+                    issues.append(IntegrityIssue(severity: .error, message: "Invalid object reference: \(entry.relativePath)"))
+                    continue
+                }
+                guard referencedHashes.insert(hash).inserted else { continue }
+                let object = objectURL(for: hash)
+                guard fileManager.fileExists(atPath: object.path) else {
+                    issues.append(IntegrityIssue(severity: .error, message: "Missing object: \(hash)"))
+                    continue
+                }
+                if deep, try Self.hashFile(at: object) != hash {
+                    issues.append(IntegrityIssue(severity: .error, message: "Object hash mismatch: \(hash)"))
+                }
+            }
+        }
+
+        let storedObjects = try storedObjectURLs()
+        let orphanCount = storedObjects.lazy.filter { !referencedHashes.contains($0.lastPathComponent) }.count
+        if orphanCount > 0 {
+            issues.append(IntegrityIssue(
+                severity: .warning,
+                message: "\(orphanCount) unreferenced objects can be reclaimed."
+            ))
+        }
+        let availableCapacity = try? storageURL.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        ).volumeAvailableCapacityForImportantUsage
+        return StoreIntegrityReport(
+            snapshotCount: manifestURLs.count,
+            referencedObjectCount: referencedHashes.count,
+            storedObjectCount: storedObjects.count,
+            orphanObjectCount: orphanCount,
+            availableCapacity: availableCapacity,
+            issues: issues
+        )
+    }
+
+    public func garbageCollect() throws -> GarbageCollectionResult {
+        try prepare()
+        let lockDescriptor = try acquireExclusiveStoreLock()
+        defer { releaseStoreLock(lockDescriptor) }
+        guard try metadataStore.integrityMessages().allSatisfy({ $0.lowercased() == "ok" }),
+              try !metadataStore.hasAnyActiveProtectionAlert() else {
+            throw DurepoError.garbageCollectionUnsafe
+        }
+        return try garbageCollectUnlocked()
+    }
+
+    private func garbageCollectUnlocked() throws -> GarbageCollectionResult {
+        let referenced = try referencedContentHashes(excluding: [])
+        var deletedCount = 0
+        var reclaimedBytes: Int64 = 0
+        var modifiedDirectories: Set<URL> = []
+        for url in try storedObjectURLs() where !referenced.contains(url.lastPathComponent) {
+            let info = try url.lstatInfo()
+            try fileManager.removeItem(at: url)
+            deletedCount += 1
+            reclaimedBytes += Int64(info.st_blocks) * 512
+            modifiedDirectories.insert(url.deletingLastPathComponent())
+        }
+        for directory in modifiedDirectories { try Self.synchronizeDirectory(directory) }
+        return GarbageCollectionResult(
+            deletedObjectCount: deletedCount,
+            reclaimedByteCount: reclaimedBytes
+        )
+    }
+
     private func decodeManifestFile(_ file: String) throws -> SnapshotManifest {
         let url = manifestsURL.appending(path: file)
         do {
@@ -320,6 +506,124 @@ public actor SnapshotStore {
         } catch {
             throw DurepoError.corruptManifest(url.path)
         }
+    }
+
+    private func storedObjectURLs() throws -> [URL] {
+        guard let enumerator = fileManager.enumerator(
+            at: objectsURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        var result: [URL] = []
+        for case let url as URL in enumerator {
+            guard Self.isValidContentHash(url.lastPathComponent),
+                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+            result.append(url)
+        }
+        return result
+    }
+
+    private func hasGitLockFile(in repositoryURL: URL) throws -> Bool {
+        let gitURL = repositoryURL.appending(path: ".git", directoryHint: .isDirectory)
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: gitURL.path, isDirectory: &isDirectory), isDirectory.boolValue,
+              let enumerator = fileManager.enumerator(
+                at: gitURL,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsPackageDescendants]
+              ) else { return false }
+        for case let url as URL in enumerator where url.lastPathComponent.hasSuffix(".lock") {
+            return true
+        }
+        return false
+    }
+
+    private func ensureStorageCapacity(for candidateBytes: Int64) throws {
+        let values = try storageURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        guard let available = values.volumeAvailableCapacityForImportantUsage else { return }
+        let reserve: Int64 = 256 * 1_048_576
+        let expectedGrowth = min(max(0, candidateBytes), 1_073_741_824)
+        guard available >= reserve + expectedGrowth else {
+            throw DurepoError.insufficientStorage(available: available, required: reserve + expectedGrowth)
+        }
+    }
+
+    private func storageAllocatedByteCount() throws -> Int64 {
+        try storedObjectURLs().reduce(Int64(0)) { total, url in
+            total + Int64(try url.lstatInfo().st_blocks) * 512
+        }
+    }
+
+    private func applyCapacityRetention() throws {
+        var allocated = try storageAllocatedByteCount()
+        while allocated > maximumStorageByteCount {
+            guard let manifestFile = try metadataStore.pruneOldestCapacityCandidate() else { return }
+            let manifestURL = manifestsURL.appending(path: manifestFile)
+            if fileManager.fileExists(atPath: manifestURL.path) {
+                try fileManager.removeItem(at: manifestURL)
+                try Self.synchronizeDirectory(manifestsURL)
+            }
+            _ = try garbageCollectUnlocked()
+            allocated = try storageAllocatedByteCount()
+        }
+    }
+
+    private static func detectAnomaly(
+        previousEntries: [String: IndexedSnapshotEntry]?,
+        currentEntries: [IndexedSnapshotEntry]
+    ) -> RepositoryAnomaly? {
+        guard let previousEntries, !previousEntries.isEmpty else { return nil }
+        let currentByPath = Dictionary(uniqueKeysWithValues: currentEntries.map { ($0.entry.relativePath, $0.entry) })
+        let previousFiles = previousEntries.values.filter { $0.entry.kind == .file }
+        let currentFiles = currentEntries.filter { $0.entry.kind == .file }
+
+        let previouslyHadGit = previousEntries.keys.contains { $0 == ".git" || $0.hasPrefix(".git/") }
+        let currentlyHasGit = currentByPath.keys.contains { $0 == ".git" || $0.hasPrefix(".git/") }
+        if previouslyHadGit && !currentlyHasGit {
+            return RepositoryAnomaly(
+                kind: .gitDirectoryDeleted,
+                message: "The .git directory disappeared. The last healthy snapshot was protected.",
+                previousFileCount: previousFiles.count
+            )
+        }
+
+        let removedFileCount = previousFiles.reduce(into: 0) { count, indexed in
+            if currentByPath[indexed.entry.relativePath]?.kind != .file { count += 1 }
+        }
+        let previousFileCount = previousFiles.count
+        let removalRatio = previousFileCount == 0 ? 0 : Double(removedFileCount) / Double(previousFileCount)
+        if removedFileCount >= 1_000 || (removedFileCount >= 50 && removalRatio >= 0.35) {
+            return RepositoryAnomaly(
+                kind: .massDeletion,
+                message: "A destructive change removed \(removedFileCount) of \(previousFileCount) files. The last healthy snapshot was protected.",
+                removedFileCount: removedFileCount,
+                previousFileCount: previousFileCount
+            )
+        }
+        if previousFileCount >= 20, currentFiles.count * 2 <= previousFileCount, removedFileCount >= 20 {
+            return RepositoryAnomaly(
+                kind: .fileCountDrop,
+                message: "The repository file count dropped from \(previousFileCount) to \(currentFiles.count). The last healthy snapshot was protected.",
+                removedFileCount: removedFileCount,
+                previousFileCount: previousFileCount
+            )
+        }
+
+        let zeroedCount = previousFiles.reduce(into: 0) { count, indexed in
+            guard indexed.entry.byteCount > 0,
+                  let current = currentByPath[indexed.entry.relativePath],
+                  current.kind == .file,
+                  current.byteCount == 0 else { return }
+            count += 1
+        }
+        if zeroedCount >= 50 || (previousFileCount >= 20 && zeroedCount * 2 >= previousFileCount) {
+            return RepositoryAnomaly(
+                kind: .massZeroByte,
+                message: "A destructive change reduced \(zeroedCount) files to zero bytes. The last healthy snapshot was protected.",
+                previousFileCount: previousFileCount
+            )
+        }
+        return nil
     }
 
     private func referencedContentHashes(excluding excludedFiles: Set<String>) throws -> Set<String> {
@@ -351,6 +655,22 @@ public actor SnapshotStore {
             ($0 >= Character("0").asciiValue! && $0 <= Character("9").asciiValue!) ||
                 ($0 >= Character("a").asciiValue! && $0 <= Character("f").asciiValue!)
         }
+    }
+
+    private static func manifestPathIssues(_ entries: [SnapshotEntry]) -> [String] {
+        var issues: [String] = []
+        let paths = entries.map(\.relativePath)
+        if Set(paths).count != paths.count { issues.append("duplicate path") }
+        let symbolicLinkPaths = entries.lazy.filter { $0.kind == .symbolicLink }.map(\.relativePath)
+        for path in paths {
+            if path.isEmpty || path.contains("\0") || (try? validateRelativeChangePath(path)) != path {
+                issues.append(path)
+            }
+            if symbolicLinkPaths.contains(where: { path.hasPrefix($0 + "/") }) {
+                issues.append("entry below symbolic link: \(path)")
+            }
+        }
+        return issues
     }
 
     private func acquireExclusiveStoreLock() throws -> Int32 {
@@ -523,7 +843,13 @@ public actor SnapshotStore {
                 kind: kind,
                 posixMode: UInt32(info.st_mode & 0o7777),
                 modifiedAt: Self.modificationDate(info),
-                symbolicLinkDestination: linkDestination
+                symbolicLinkDestination: linkDestination,
+                allocatedByteCount: Int64(info.st_blocks) * 512,
+                extendedAttributes: try FileMetadata.extendedAttributes(
+                    at: url,
+                    noFollow: kind == .symbolicLink
+                ),
+                aclText: kind == .symbolicLink ? nil : try FileMetadata.aclText(at: url)
             ),
             fingerprint: FileFingerprint(info)
         )
@@ -638,6 +964,8 @@ public actor SnapshotStore {
         let hash: String
         let metadata: stat
         let method: SnapshotCaptureMethod
+        let capturedExtendedAttributes = try FileMetadata.extendedAttributes(fileDescriptor: descriptor)
+        let capturedACL = try FileMetadata.aclText(fileDescriptor: descriptor)
         let cloneBlockedFlags = UInt32(UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND)
         let canSafelyClone = before.st_flags & cloneBlockedFlags == 0
         if cloneFilesWhenSupported, canSafelyClone, try cloneFile(descriptor: descriptor, to: temporaryURL) {
@@ -676,7 +1004,11 @@ public actor SnapshotStore {
             contentHash: hash,
             byteCount: Int64(metadata.st_size),
             posixMode: UInt32(metadata.st_mode & 0o7777),
-            modifiedAt: modificationDate(metadata)
+            modifiedAt: modificationDate(metadata),
+            hardLinkGroup: before.st_nlink > 1 ? "\(before.st_dev):\(before.st_ino)" : nil,
+            allocatedByteCount: Int64(before.st_blocks) * 512,
+            extendedAttributes: capturedExtendedAttributes,
+            aclText: capturedACL
         )
         return SnapshotCaptureResult(
             indexedEntry: IndexedSnapshotEntry(entry: entry, fingerprint: FileFingerprint(before)),
@@ -782,6 +1114,8 @@ public actor SnapshotStore {
     }
 
     private static func normalizeStoredFile(at url: URL) throws {
+        try FileMetadata.removeExtendedAttributes(at: url)
+        try FileMetadata.removeACL(at: url)
         guard Darwin.chflags(url.path, 0) == 0 else { throw posixError() }
         guard Darwin.chmod(url.path, S_IRUSR | S_IWUSR) == 0 else { throw posixError() }
     }
@@ -854,11 +1188,16 @@ public actor SnapshotStore {
             .filter { $0.pathExtension == "json" }
         for url in urls {
             guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent) else { continue }
-            if try metadataStore.containsSnapshot(id: id) { continue }
             do {
                 let manifest = try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
-                try metadataStore.index(manifest, manifestFile: url.lastPathComponent)
-                try metadataStore.invalidateCurrentIndex(repositoryID: manifest.repositoryID)
+                if try metadataStore.containsSnapshot(id: id) {
+                    if !manifest.entries.isEmpty, try !metadataStore.containsSnapshotEntries(id: id) {
+                        try metadataStore.indexEntries(manifest)
+                    }
+                } else {
+                    try metadataStore.index(manifest, manifestFile: url.lastPathComponent)
+                    try metadataStore.invalidateCurrentIndex(repositoryID: manifest.repositoryID)
+                }
             } catch {
                 throw DurepoError.corruptManifest(url.path)
             }

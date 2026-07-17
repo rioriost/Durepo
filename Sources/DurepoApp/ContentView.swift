@@ -55,6 +55,30 @@ private struct DashboardView: View {
                 Text("Dashboard")
                     .font(.largeTitle.bold())
 
+                ForEach(model.protectionAlerts) { alert in
+                    GroupBox {
+                        HStack(alignment: .top, spacing: 12) {
+                            Image(systemName: "exclamationmark.shield.fill")
+                                .font(.title2)
+                                .foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("Destructive Change Detected")
+                                    .font(.headline)
+                                Text(model.repositoryName(for: alert.repositoryID))
+                                    .font(.subheadline.bold())
+                                Text(model.protectionAlertMessage(alert))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Acknowledge") {
+                                Task { await model.acknowledge(alert) }
+                            }
+                        }
+                        .padding(6)
+                    }
+                }
+
                 HStack(spacing: 16) {
                     MetricCard(title: "Protected repositories", value: "\(model.repositories.count)", symbol: "folder.badge.gearshape")
                     MetricCard(title: "Snapshots", value: "\(model.snapshots.count)", symbol: "clock.arrow.circlepath")
@@ -380,6 +404,8 @@ private struct SnapshotsView: View {
 private struct SnapshotTable: View {
     @Bindable var model: AppModel
     let snapshots: [SnapshotSummary]
+    @State private var snapshotShowingChanges: SnapshotSummary?
+    @State private var snapshotRestoringInPlace: SnapshotSummary?
 
     var body: some View {
         Table(snapshots) {
@@ -392,12 +418,232 @@ private struct SnapshotTable: View {
             TableColumn("Size") { snapshot in
                 Text(ByteCountFormatter.string(fromByteCount: snapshot.logicalByteCount, countStyle: .file))
             }
-            TableColumn("") { snapshot in
-                Button("Restore…") { Task { await model.restore(snapshot) } }
-                    .disabled(model.isBusy)
+            TableColumn("Status") { snapshot in
+                HStack(spacing: 5) {
+                    if snapshot.isProtected {
+                        Image(systemName: "shield.fill")
+                            .foregroundStyle(.green)
+                            .help("Protected from retention")
+                    }
+                    if snapshot.healthState == .anomalous {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .help("Destructive change detected")
+                    }
+                }
             }
-            .width(90)
+            .width(70)
+            TableColumn("") { snapshot in
+                HStack {
+                    Button {
+                        Task { await model.setSnapshotProtected(snapshot, isProtected: !snapshot.isProtected) }
+                    } label: {
+                        Image(systemName: snapshot.isProtected ? "shield.slash" : "shield")
+                    }
+                    .help(snapshot.isProtected ? "Remove Protection" : "Protect Snapshot")
+                    Button { snapshotShowingChanges = snapshot } label: {
+                        Image(systemName: "list.bullet.rectangle")
+                    }
+                        .help("Changes…")
+                        .disabled(model.isBusy)
+                    Menu {
+                        Button("Restore…") { Task { await model.restore(snapshot) } }
+                        Button("Restore in Place…") { snapshotRestoringInPlace = snapshot }
+                            .disabled(!model.repositories.contains { $0.id == snapshot.repositoryID })
+                    } label: {
+                        Image(systemName: "arrow.counterclockwise")
+                    }
+                    .help("Restore…")
+                        .disabled(model.isBusy || !model.repositories.contains { $0.id == snapshot.repositoryID })
+                }
+            }
+            .width(125)
         }
+        .sheet(item: $snapshotShowingChanges) { snapshot in
+            SnapshotChangesDialog(
+                model: model,
+                snapshot: snapshot,
+                cancel: { snapshotShowingChanges = nil },
+                restore: { paths in
+                    snapshotShowingChanges = nil
+                    Task { await model.restore(snapshot, selecting: paths) }
+                }
+            )
+        }
+        .sheet(item: $snapshotRestoringInPlace) { snapshot in
+            InPlaceRestoreDialog(
+                snapshot: snapshot,
+                cancel: { snapshotRestoringInPlace = nil },
+                restore: {
+                    snapshotRestoringInPlace = nil
+                    Task { await model.restoreInPlace(snapshot) }
+                }
+            )
+        }
+    }
+}
+
+private struct InPlaceRestoreDialog: View {
+    let snapshot: SnapshotSummary
+    let cancel: () -> Void
+    let restore: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90.circle.fill")
+                    .font(.system(size: 32))
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Restore Repository in Place?")
+                        .font(.title2.bold())
+                    Text(snapshot.repositoryName)
+                        .font(.headline)
+                    Text("Durepo first creates a complete pre-restore snapshot, verifies the selected snapshot, and then replaces the repository. If replacement fails, the original directory is put back.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack {
+                Button("Cancel", action: cancel)
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Restore in Place", role: .destructive, action: restore)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+            }
+        }
+        .padding(24)
+        .frame(width: 680)
+        .interactiveDismissDisabled()
+    }
+}
+
+private struct SnapshotChangesDialog: View {
+    private enum ListingMode: String, CaseIterable, Identifiable {
+        case changes
+        case allFiles
+        var id: Self { self }
+    }
+
+    @Bindable var model: AppModel
+    let snapshot: SnapshotSummary
+    let cancel: () -> Void
+    let restore: (Set<String>) -> Void
+
+    @State private var entries: [SnapshotDiffEntry] = []
+    @State private var selection: Set<String> = []
+    @State private var isLoading = false
+    @State private var hasMore = true
+    @State private var listingMode = ListingMode.changes
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Snapshot Changes")
+                .font(.title2.bold())
+            Text(snapshot.repositoryName)
+                .font(.headline)
+            Picker("Contents", selection: $listingMode) {
+                Text("Changes").tag(ListingMode.changes)
+                Text("All Files").tag(ListingMode.allFiles)
+            }
+            .pickerStyle(.segmented)
+            Text(listingMode == .changes
+                 ? "Select files or directories to restore. Removed items are shown for reference and cannot be restored from this snapshot."
+                 : "Browse every item in this snapshot and select files or directories to restore.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            List(entries) { entry in
+                HStack(spacing: 10) {
+                    Toggle("", isOn: selectionBinding(for: entry))
+                        .labelsHidden()
+                        .disabled(entry.kind == .removed)
+                    Image(systemName: entry.entryKind == .directory ? "folder" : entry.entryKind == .symbolicLink ? "link" : "doc")
+                        .foregroundStyle(.secondary)
+                    Text(entry.kind.localizedTitle)
+                        .font(.caption)
+                        .foregroundStyle(entry.kind == .removed ? .red : .secondary)
+                        .frame(width: 70, alignment: .leading)
+                    Text(entry.relativePath)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    if entry.entryKind == .file {
+                        Text(ByteCountFormatter.string(fromByteCount: entry.byteCount, countStyle: .file))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .overlay {
+                if entries.isEmpty, !isLoading, !hasMore {
+                    ContentUnavailableView("No changes", systemImage: "equal.circle")
+                }
+            }
+
+            if hasMore {
+                HStack {
+                    Spacer()
+                    Button("Load More") { Task { await loadNextPage() } }
+                        .disabled(isLoading)
+                    if isLoading { ProgressView().controlSize(.small) }
+                    Spacer()
+                }
+            }
+
+            Divider()
+            HStack {
+                Button("Cancel", action: cancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Select All") {
+                    selection.formUnion(entries.lazy.filter { $0.kind != .removed }.map(\.relativePath))
+                }
+                .disabled(entries.allSatisfy { $0.kind == .removed })
+                Spacer()
+                Text(String(localized: "\(selection.count) selected"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Restore Selected") { restore(selection) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(selection.isEmpty || isLoading)
+            }
+        }
+        .padding(24)
+        .frame(width: 820, height: 600)
+        .interactiveDismissDisabled()
+        .task { await loadNextPage() }
+        .onChange(of: listingMode) {
+            entries = []
+            selection = []
+            hasMore = true
+            Task { await loadNextPage() }
+        }
+    }
+
+    private func selectionBinding(for entry: SnapshotDiffEntry) -> Binding<Bool> {
+        Binding(
+            get: { selection.contains(entry.relativePath) },
+            set: { selected in
+                if selected { selection.insert(entry.relativePath) }
+                else { selection.remove(entry.relativePath) }
+            }
+        )
+    }
+
+    private func loadNextPage() async {
+        guard hasMore, !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
+        let page = listingMode == .changes
+            ? await model.snapshotDiff(snapshot, offset: entries.count)
+            : await model.snapshotEntries(snapshot, offset: entries.count)
+        guard let page else {
+            hasMore = false
+            return
+        }
+        entries.append(contentsOf: page.entries)
+        hasMore = page.hasMore
     }
 }
 
@@ -449,8 +695,36 @@ struct SettingsView: View {
             )
             .frame(height: 180)
             .padding(.bottom, 16)
+
+            Divider()
+
+            Text("Diagnostics")
+                .font(.headline)
+            if let report = model.integrityReport {
+                Label(
+                    report.isHealthy ? "Storage is healthy" : "Storage needs attention",
+                    systemImage: report.isHealthy ? "checkmark.shield.fill" : "exclamationmark.shield.fill"
+                )
+                .foregroundStyle(report.isHealthy ? .green : .red)
+                Text(String(
+                    format: String(localized: "%lld snapshots • %lld objects • %lld reclaimable"),
+                    Int64(report.snapshotCount),
+                    Int64(report.storedObjectCount),
+                    Int64(report.orphanObjectCount)
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("Run Integrity Check") { Task { await model.runIntegrityCheck() } }
+                Button("Reclaim Data") { Task { await model.garbageCollect() } }
+                    .disabled(model.integrityReport?.orphanObjectCount == 0)
+                Button("Export…") { model.exportDiagnostics() }
+                    .disabled(model.integrityReport == nil)
+            }
+            .disabled(model.isBusy)
         }
-        .frame(minHeight: 390)
+        .frame(minHeight: 500)
         .navigationTitle("Durepo Settings")
     }
 }
@@ -463,6 +737,17 @@ private extension SnapshotReason {
         case .fileSystemEvent: String(localized: "File Change")
         case .preRestore: String(localized: "Before Restore")
         case .smokeTest: String(localized: "Smoke Test")
+        }
+    }
+}
+
+private extension SnapshotDiffKind {
+    var localizedTitle: String {
+        switch self {
+        case .added: String(localized: "Added")
+        case .modified: String(localized: "Modified")
+        case .removed: String(localized: "Removed")
+        case .unchanged: String(localized: "Existing")
         }
     }
 }

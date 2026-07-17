@@ -35,6 +35,8 @@ private actor AgentCoordinator {
     private var debounceTasks: [UUID: Task<Void, Never>] = [:]
     private var burstStartedAt: [UUID: ContinuousClock.Instant] = [:]
     private var snapshotting: Set<UUID> = []
+    private var lastLightweightIntegrityCheck = Date()
+    private var lastDeepIntegrityCheck = Date()
 
     init(storageURL: URL) {
         registry = RepositoryRegistry(storageURL: storageURL)
@@ -46,6 +48,36 @@ private actor AgentCoordinator {
         let records = try await registry.records().filter(\.isEnabled)
         let globalRules = try exclusionRuleStore.rules()
         await updateSessions(records, globalRules: globalRules)
+        await runScheduledIntegrityCheckIfNeeded()
+    }
+
+    private func runScheduledIntegrityCheckIfNeeded() async {
+        let now = Date()
+        let deep = now.timeIntervalSince(lastDeepIntegrityCheck) >= 86_400
+        guard deep || now.timeIntervalSince(lastLightweightIntegrityCheck) >= 3_600 else { return }
+        lastLightweightIntegrityCheck = now
+        if deep { lastDeepIntegrityCheck = now }
+        do {
+            let report = try await store.checkIntegrity(deep: deep)
+            if report.isHealthy {
+                logger.info("Scheduled storage integrity check completed")
+            } else {
+                let message = report.issues.first(where: { $0.severity == .error })?.message
+                    ?? "Durepo storage integrity check failed."
+                logger.fault("Storage integrity check failed: \(message, privacy: .public)")
+                let content = UNMutableNotificationContent()
+                content.title = "Durepo"
+                content.body = message
+                content.sound = .default
+                try? await UNUserNotificationCenter.current().add(UNNotificationRequest(
+                    identifier: "durepo-integrity",
+                    content: content,
+                    trigger: nil
+                ))
+            }
+        } catch {
+            logger.error("Scheduled integrity check could not complete: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     private func updateSessions(_ records: [RepositoryRecord], globalRules: [String]) async {
@@ -88,6 +120,7 @@ private actor AgentCoordinator {
                     record: agentRecord,
                     url: url,
                     exclusionRules: exclusionRules,
+                    suppressNextAnomaly: rulesChanged,
                     watcher: watcher
                 )
                 logger.info("Monitoring \(agentRecord.displayName, privacy: .private)")
@@ -209,16 +242,25 @@ private actor AgentCoordinator {
                     repositoryID: repositoryID,
                     through: targetEventID
                 )
+                let suppressRestoredEvents = try await store.hasRestoreSuppression(repositoryID: repositoryID)
                 let manifest = try await store.createSnapshot(
                     repositoryURL: session.url,
                     repositoryID: session.record.id,
                     reason: .fileSystemEvent,
                     changeSet: changeSet,
                     exclusionRules: session.exclusionRules,
+                    detectAnomalies: !session.suppressNextAnomaly && !suppressRestoredEvents,
                     requiresRegisteredRepository: true
                 )
+                session.suppressNextAnomaly = false
+                if suppressRestoredEvents {
+                    try await store.clearRestoreSuppression(repositoryID: repositoryID)
+                }
                 let committed = try await store.commitEvents(repositoryID: repositoryID, through: targetEventID)
                 try await store.clearAgentError(repositoryID: repositoryID)
+                if let alert = try await store.protectionAlerts().first(where: { $0.snapshotID == manifest.id }) {
+                    await publishProtectionAlert(alert)
+                }
                 logger.info("Created snapshot \(manifest.id.uuidString, privacy: .public) through event \(targetEventID)")
                 if sessions[repositoryID]?.exclusionRules != session.exclusionRules {
                     try await store.requireFullScan(repositoryID: repositoryID)
@@ -228,6 +270,21 @@ private actor AgentCoordinator {
                 guard committed.hasPendingEvents else { return }
                 logger.info("Changes arrived during snapshot; rescanning \(session.record.displayName, privacy: .private)")
             } catch DurepoError.repositoryNotRegistered {
+                return
+            } catch DurepoError.invalidRepository {
+                do {
+                    let alert = try await store.recordProtectionAlert(
+                        repositoryID: repositoryID,
+                        anomaly: RepositoryAnomaly(
+                            kind: .repositoryUnavailable,
+                            message: "The protected repository is unavailable. The last healthy snapshot was protected."
+                        )
+                    )
+                    await publishProtectionAlert(alert)
+                } catch {
+                    await report(error, repositoryID: repositoryID)
+                }
+                scheduleRetry(for: repositoryID)
                 return
             } catch {
                 await report(error, repositoryID: repositoryID)
@@ -264,18 +321,44 @@ private actor AgentCoordinator {
             logger.error("Unable to publish agent error: \(error.localizedDescription, privacy: .public)")
         }
     }
+
+    private func publishProtectionAlert(_ alert: ProtectionAlert) async {
+        let content = UNMutableNotificationContent()
+        content.title = "Durepo"
+        content.subtitle = "Recovery snapshot protected"
+        content.body = alert.message
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "durepo-protection-\(alert.id.uuidString)",
+            content: content,
+            trigger: nil
+        )
+        do {
+            try await UNUserNotificationCenter.current().add(request)
+        } catch {
+            logger.error("Unable to publish protection alert: \(error.localizedDescription, privacy: .public)")
+        }
+    }
 }
 
 private final class RepositorySession: @unchecked Sendable {
     let record: RepositoryRecord
     let url: URL
     let exclusionRules: ExclusionRuleSet
+    var suppressNextAnomaly: Bool
     let watcher: FSEventWatcher
 
-    init(record: RepositoryRecord, url: URL, exclusionRules: ExclusionRuleSet, watcher: FSEventWatcher) {
+    init(
+        record: RepositoryRecord,
+        url: URL,
+        exclusionRules: ExclusionRuleSet,
+        suppressNextAnomaly: Bool,
+        watcher: FSEventWatcher
+    ) {
         self.record = record
         self.url = url
         self.exclusionRules = exclusionRules
+        self.suppressNextAnomaly = suppressNextAnomaly
         self.watcher = watcher
     }
 

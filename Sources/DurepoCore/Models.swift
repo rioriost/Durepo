@@ -272,10 +272,83 @@ public enum SnapshotReason: String, Codable, Sendable {
     case smokeTest
 }
 
+public enum SnapshotHealthState: String, Codable, Sendable {
+    case normal
+    case anomalous
+}
+
+public enum RepositoryAnomalyKind: String, Codable, Sendable {
+    case gitDirectoryDeleted
+    case repositoryUnavailable
+    case massDeletion
+    case fileCountDrop
+    case massZeroByte
+}
+
+public struct RepositoryAnomaly: Codable, Hashable, Sendable {
+    public let kind: RepositoryAnomalyKind
+    public let message: String
+    public let removedFileCount: Int
+    public let previousFileCount: Int
+
+    public init(
+        kind: RepositoryAnomalyKind,
+        message: String,
+        removedFileCount: Int = 0,
+        previousFileCount: Int = 0
+    ) {
+        self.kind = kind
+        self.message = message
+        self.removedFileCount = removedFileCount
+        self.previousFileCount = previousFileCount
+    }
+}
+
+public struct ProtectionAlert: Identifiable, Hashable, Sendable {
+    public let id: UUID
+    public let repositoryID: UUID
+    public let snapshotID: UUID?
+    public let protectedSnapshotID: UUID?
+    public let kind: RepositoryAnomalyKind
+    public let message: String
+    public let createdAt: Date
+    public let acknowledgedAt: Date?
+
+    public init(
+        id: UUID,
+        repositoryID: UUID,
+        snapshotID: UUID?,
+        protectedSnapshotID: UUID?,
+        kind: RepositoryAnomalyKind,
+        message: String,
+        createdAt: Date,
+        acknowledgedAt: Date?
+    ) {
+        self.id = id
+        self.repositoryID = repositoryID
+        self.snapshotID = snapshotID
+        self.protectedSnapshotID = protectedSnapshotID
+        self.kind = kind
+        self.message = message
+        self.createdAt = createdAt
+        self.acknowledgedAt = acknowledgedAt
+    }
+}
+
 public enum SnapshotEntryKind: String, Codable, Sendable {
     case file
     case directory
     case symbolicLink
+}
+
+public struct SnapshotExtendedAttribute: Codable, Hashable, Sendable {
+    public let name: String
+    public let value: Data
+
+    public init(name: String, value: Data) {
+        self.name = name
+        self.value = value
+    }
 }
 
 public struct SnapshotEntry: Codable, Hashable, Sendable {
@@ -286,6 +359,10 @@ public struct SnapshotEntry: Codable, Hashable, Sendable {
     public let posixMode: UInt32
     public let modifiedAt: Date?
     public let symbolicLinkDestination: String?
+    public let hardLinkGroup: String?
+    public let allocatedByteCount: Int64?
+    public let extendedAttributes: [SnapshotExtendedAttribute]?
+    public let aclText: String?
 
     public init(
         relativePath: String,
@@ -294,7 +371,11 @@ public struct SnapshotEntry: Codable, Hashable, Sendable {
         byteCount: Int64 = 0,
         posixMode: UInt32,
         modifiedAt: Date? = nil,
-        symbolicLinkDestination: String? = nil
+        symbolicLinkDestination: String? = nil,
+        hardLinkGroup: String? = nil,
+        allocatedByteCount: Int64? = nil,
+        extendedAttributes: [SnapshotExtendedAttribute]? = nil,
+        aclText: String? = nil
     ) {
         self.relativePath = relativePath
         self.kind = kind
@@ -303,6 +384,10 @@ public struct SnapshotEntry: Codable, Hashable, Sendable {
         self.posixMode = posixMode
         self.modifiedAt = modifiedAt
         self.symbolicLinkDestination = symbolicLinkDestination
+        self.hardLinkGroup = hardLinkGroup
+        self.allocatedByteCount = allocatedByteCount
+        self.extendedAttributes = extendedAttributes
+        self.aclText = aclText
     }
 }
 
@@ -352,6 +437,8 @@ public struct SnapshotSummary: Identifiable, Hashable, Sendable {
     public let reason: SnapshotReason
     public let fileCount: Int
     public let logicalByteCount: Int64
+    public let isProtected: Bool
+    public let healthState: SnapshotHealthState
 
     public init(manifest: SnapshotManifest) {
         id = manifest.id
@@ -361,6 +448,8 @@ public struct SnapshotSummary: Identifiable, Hashable, Sendable {
         reason = manifest.reason
         fileCount = manifest.fileCount
         logicalByteCount = manifest.logicalByteCount
+        isProtected = false
+        healthState = .normal
     }
 
     public init(
@@ -370,7 +459,9 @@ public struct SnapshotSummary: Identifiable, Hashable, Sendable {
         createdAt: Date,
         reason: SnapshotReason,
         fileCount: Int,
-        logicalByteCount: Int64
+        logicalByteCount: Int64,
+        isProtected: Bool = false,
+        healthState: SnapshotHealthState = .normal
     ) {
         self.id = id
         self.repositoryID = repositoryID
@@ -379,6 +470,107 @@ public struct SnapshotSummary: Identifiable, Hashable, Sendable {
         self.reason = reason
         self.fileCount = fileCount
         self.logicalByteCount = logicalByteCount
+        self.isProtected = isProtected
+        self.healthState = healthState
+    }
+}
+
+public enum SnapshotDiffKind: String, Codable, Sendable {
+    case added
+    case modified
+    case removed
+    case unchanged
+}
+
+public struct SnapshotDiffEntry: Identifiable, Hashable, Sendable {
+    public var id: String { relativePath }
+    public let relativePath: String
+    public let kind: SnapshotDiffKind
+    public let entryKind: SnapshotEntryKind
+    public let byteCount: Int64
+
+    public init(relativePath: String, kind: SnapshotDiffKind, entryKind: SnapshotEntryKind, byteCount: Int64) {
+        self.relativePath = relativePath
+        self.kind = kind
+        self.entryKind = entryKind
+        self.byteCount = byteCount
+    }
+}
+
+public struct SnapshotDiffPage: Sendable {
+    public let entries: [SnapshotDiffEntry]
+    public let offset: Int
+    public let hasMore: Bool
+
+    public init(entries: [SnapshotDiffEntry], offset: Int, hasMore: Bool) {
+        self.entries = entries
+        self.offset = offset
+        self.hasMore = hasMore
+    }
+}
+
+public struct InPlaceRestoreResult: Sendable {
+    public let restoredURL: URL
+    public let preRestoreSnapshot: SnapshotManifest
+
+    public init(restoredURL: URL, preRestoreSnapshot: SnapshotManifest) {
+        self.restoredURL = restoredURL
+        self.preRestoreSnapshot = preRestoreSnapshot
+    }
+}
+
+public enum IntegrityIssueSeverity: String, Codable, Sendable {
+    case warning
+    case error
+}
+
+public struct IntegrityIssue: Codable, Hashable, Sendable {
+    public let severity: IntegrityIssueSeverity
+    public let message: String
+
+    public init(severity: IntegrityIssueSeverity, message: String) {
+        self.severity = severity
+        self.message = message
+    }
+}
+
+public struct StoreIntegrityReport: Codable, Sendable {
+    public let checkedAt: Date
+    public let snapshotCount: Int
+    public let referencedObjectCount: Int
+    public let storedObjectCount: Int
+    public let orphanObjectCount: Int
+    public let availableCapacity: Int64?
+    public let issues: [IntegrityIssue]
+
+    public var isHealthy: Bool { !issues.contains { $0.severity == .error } }
+
+    public init(
+        checkedAt: Date = .now,
+        snapshotCount: Int,
+        referencedObjectCount: Int,
+        storedObjectCount: Int,
+        orphanObjectCount: Int,
+        availableCapacity: Int64?,
+        issues: [IntegrityIssue]
+    ) {
+        self.checkedAt = checkedAt
+        self.snapshotCount = snapshotCount
+        self.referencedObjectCount = referencedObjectCount
+        self.storedObjectCount = storedObjectCount
+        self.orphanObjectCount = orphanObjectCount
+        self.availableCapacity = availableCapacity
+        self.issues = issues
+    }
+}
+
+public struct GarbageCollectionResult: Sendable, Equatable {
+    public let deletedObjectCount: Int
+    public let reclaimedByteCount: Int64
+
+    public init(deletedObjectCount: Int, reclaimedByteCount: Int64) {
+        self.deletedObjectCount = deletedObjectCount
+        self.reclaimedByteCount = reclaimedByteCount
     }
 }
 
@@ -438,6 +630,10 @@ public enum DurepoError: Error, LocalizedError, Sendable {
     case unsupportedFormat(Int)
     case corruptManifest(String)
     case repositoryNotRegistered
+    case emptyRestoreSelection
+    case garbageCollectionUnsafe
+    case insufficientStorage(available: Int64, required: Int64)
+    case gitOperationInProgress
 
     public var errorDescription: String? {
         switch self {
@@ -453,6 +649,12 @@ public enum DurepoError: Error, LocalizedError, Sendable {
         case .unsupportedFormat(let version): localized("Unsupported snapshot format: %lld", Int64(version))
         case .corruptManifest(let path): localized("Snapshot manifest is corrupted: %@", path)
         case .repositoryNotRegistered: localized("The repository is no longer registered for protection.")
+        case .emptyRestoreSelection: localized("Select at least one file or directory to restore.")
+        case .garbageCollectionUnsafe: localized("Garbage collection stopped because protection is active or metadata integrity could not be confirmed.")
+        case .insufficientStorage(let available, let required):
+            localized("Not enough storage is available. Available: %lld bytes; required: %lld bytes.", available, required)
+        case .gitOperationInProgress:
+            localized("Restore in place was stopped because a Git lock file indicates an operation may be in progress.")
         }
     }
 

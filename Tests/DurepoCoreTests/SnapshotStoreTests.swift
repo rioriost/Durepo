@@ -168,6 +168,82 @@ struct SnapshotStoreTests {
         }
     }
 
+    @Test("Mass deletion protects the last healthy snapshot and pauses retention")
+    func anomalyProtectionPausesRetention() async throws {
+        try await withFixture { fixture in
+            let repositoryID = UUID()
+            for index in 0..<100 { try fixture.write("file \(index)", to: "bulk/\(index).txt") }
+            try fixture.write("ref: refs/heads/main\n", to: ".git/HEAD")
+            let store = SnapshotStore(storageURL: fixture.storage, retentionLimit: 3)
+            let healthy = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .initial
+            )
+
+            for index in 0..<60 {
+                try FileManager.default.removeItem(at: fixture.repository.appending(path: "bulk/\(index).txt"))
+            }
+            let damaged = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .fileSystemEvent,
+                detectAnomalies: true
+            )
+
+            var summaries = try await store.snapshotSummaries(repositoryID: repositoryID)
+            #expect(summaries.first { $0.id == healthy.id }?.isProtected == true)
+            #expect(summaries.first { $0.id == damaged.id }?.healthState == .anomalous)
+            let alert = try #require(try await store.protectionAlerts().first)
+            #expect(alert.kind == .massDeletion)
+            #expect(alert.protectedSnapshotID == healthy.id)
+
+            for version in 0..<5 {
+                try fixture.write("version \(version)", to: "version.txt")
+                _ = try await store.createSnapshot(
+                    repositoryURL: fixture.repository,
+                    repositoryID: repositoryID,
+                    reason: .manual
+                )
+            }
+            #expect(try await store.snapshotSummaries(repositoryID: repositoryID).count == 7)
+
+            try await store.acknowledgeProtectionAlert(id: alert.id)
+            _ = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .manual
+            )
+            summaries = try await store.snapshotSummaries(repositoryID: repositoryID)
+            #expect(summaries.count == 4)
+            #expect(summaries.contains { $0.id == healthy.id && $0.isProtected })
+        }
+    }
+
+    @Test("Repository-unavailable alert protects the latest snapshot")
+    func unavailableRepositoryProtectsLatestSnapshot() async throws {
+        try await withFixture { fixture in
+            let repositoryID = UUID()
+            try fixture.write("safe", to: "safe.txt")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let healthy = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .initial
+            )
+            let alert = try await store.recordProtectionAlert(
+                repositoryID: repositoryID,
+                anomaly: RepositoryAnomaly(
+                    kind: .repositoryUnavailable,
+                    message: "Repository unavailable"
+                )
+            )
+
+            #expect(alert.protectedSnapshotID == healthy.id)
+            #expect(try await store.snapshotSummaries(repositoryID: repositoryID).first?.isProtected == true)
+        }
+    }
+
     @Test("Deleting snapshots can retain content-addressed objects")
     func snapshotDeletionKeepsObjects() async throws {
         try await withFixture { fixture in
@@ -519,6 +595,296 @@ struct SnapshotStoreTests {
             _ = try await restorer.restore(manifest, to: fixture.restore)
             #expect(FileManager.default.fileExists(atPath: fixture.restore.appending(path: ".git/HEAD").path))
             #expect(!FileManager.default.fileExists(atPath: fixture.restore.appending(path: ".git/index.lock").path))
+        }
+    }
+
+    @Test("Snapshot differences are paged and classify added, modified, and removed paths")
+    func snapshotDiffPagination() async throws {
+        try await withFixture { fixture in
+            let repositoryID = UUID()
+            try fixture.write("old", to: "modified.txt")
+            try fixture.write("gone", to: "removed.txt")
+            try fixture.write("stable", to: "stable.txt")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            _ = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .smokeTest
+            )
+
+            try fixture.write("new", to: "modified.txt")
+            try FileManager.default.removeItem(at: fixture.repository.appending(path: "removed.txt"))
+            try fixture.write("added", to: "added.txt")
+            let second = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .smokeTest
+            )
+
+            let firstPage = try await store.snapshotDiff(id: second.id, offset: 0, limit: 2)
+            #expect(firstPage.entries.count == 2)
+            #expect(firstPage.hasMore)
+            let secondPage = try await store.snapshotDiff(id: second.id, offset: 2, limit: 2)
+            #expect(!secondPage.hasMore)
+            let changes = Dictionary(uniqueKeysWithValues: (firstPage.entries + secondPage.entries).map {
+                ($0.relativePath, $0.kind)
+            })
+            #expect(changes["added.txt"] == .added)
+            #expect(changes["modified.txt"] == .modified)
+            #expect(changes["removed.txt"] == .removed)
+
+            let allFirstPage = try await store.snapshotEntries(id: second.id, offset: 0, limit: 2)
+            let allSecondPage = try await store.snapshotEntries(id: second.id, offset: 2, limit: 2)
+            #expect(allFirstPage.hasMore)
+            #expect(!allSecondPage.hasMore)
+            #expect(Set((allFirstPage.entries + allSecondPage.entries).map(\.relativePath)) == [
+                "added.txt", "modified.txt", "stable.txt",
+            ])
+            #expect((allFirstPage.entries + allSecondPage.entries).allSatisfy { $0.kind == .unchanged })
+        }
+    }
+
+    @Test("Selective restore includes a selected directory and its required ancestors")
+    func selectiveRestore() async throws {
+        try await withFixture { fixture in
+            try fixture.write("one", to: "Sources/Nested/one.txt")
+            try fixture.write("two", to: "Sources/two.txt")
+            try fixture.write("skip", to: "Other/skip.txt")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let manifest = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: UUID(),
+                reason: .smokeTest
+            )
+            let restorer = SnapshotRestorer(store: store)
+            _ = try await restorer.restore(manifest, selecting: ["Sources/Nested"], to: fixture.restore)
+
+            #expect(FileManager.default.fileExists(atPath: fixture.restore.appending(path: "Sources/Nested/one.txt").path))
+            #expect(!FileManager.default.fileExists(atPath: fixture.restore.appending(path: "Sources/two.txt").path))
+            #expect(!FileManager.default.fileExists(atPath: fixture.restore.appending(path: "Other/skip.txt").path))
+        }
+    }
+
+    @Test("In-place restore captures the current repository before an atomic replacement")
+    func inPlaceRestore() async throws {
+        try await withFixture { fixture in
+            let repositoryID = UUID()
+            try fixture.write("snapshot", to: "tracked.txt")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let target = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .smokeTest
+            )
+            try fixture.write("current", to: "tracked.txt")
+            try fixture.write("new work", to: "uncommitted.txt")
+
+            let result = try await store.restoreInPlace(
+                snapshotID: target.id,
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                exclusionRules: .defaults
+            )
+
+            #expect(try String(contentsOf: fixture.repository.appending(path: "tracked.txt"), encoding: .utf8) == "snapshot")
+            #expect(!FileManager.default.fileExists(atPath: fixture.repository.appending(path: "uncommitted.txt").path))
+            #expect(result.preRestoreSnapshot.reason == .preRestore)
+            #expect(result.preRestoreSnapshot.entries.contains { $0.relativePath == "uncommitted.txt" })
+            #expect(try await store.hasRestoreSuppression(repositoryID: repositoryID))
+            let restorer = SnapshotRestorer(store: store)
+            let preRestoreDestination = fixture.root.appending(path: "pre-restore")
+            _ = try await restorer.restore(result.preRestoreSnapshot, to: preRestoreDestination)
+            #expect(try String(contentsOf: preRestoreDestination.appending(path: "tracked.txt"), encoding: .utf8) == "current")
+        }
+    }
+
+    @Test("Hard links, sparse allocation, and extended attributes survive restore")
+    func macMetadataRoundTrip() async throws {
+        try await withFixture { fixture in
+            try fixture.write("linked", to: "links/original.txt")
+            try FileManager.default.linkItem(
+                at: fixture.repository.appending(path: "links/original.txt"),
+                to: fixture.repository.appending(path: "links/alias.txt")
+            )
+            let attributeValue = Data("metadata".utf8)
+            let attributeResult = attributeValue.withUnsafeBytes { bytes in
+                setxattr(
+                    fixture.repository.appending(path: "links/original.txt").path,
+                    "com.example.durepo-test",
+                    bytes.baseAddress,
+                    bytes.count,
+                    0,
+                    0
+                )
+            }
+            #expect(attributeResult == 0)
+            let aclValue = "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:allow:read\n"
+            let acl = try #require(acl_from_text(aclValue))
+            #expect(acl_set_file(
+                fixture.repository.appending(path: "links/original.txt").path,
+                ACL_TYPE_EXTENDED,
+                acl
+            ) == 0)
+            acl_free(UnsafeMutableRawPointer(acl))
+
+            let sparse = fixture.repository.appending(path: "sparse.bin")
+            let descriptor = Darwin.open(sparse.path, O_CREAT | O_WRONLY | O_CLOEXEC, 0o600)
+            #expect(descriptor >= 0)
+            guard descriptor >= 0 else { return }
+            #expect(Darwin.ftruncate(descriptor, 8 * 1_048_576) == 0)
+            Darwin.close(descriptor)
+
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let repositoryID = UUID()
+            let manifest = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .smokeTest
+            )
+            let sparseEntry = manifest.entries.first { $0.relativePath == "sparse.bin" }
+            #expect((sparseEntry?.allocatedByteCount ?? .max) < (sparseEntry?.byteCount ?? 0))
+            let originalEntry = try #require(manifest.entries.first { $0.relativePath == "links/original.txt" })
+            let storedObjectURL = await store.objectURL(for: try #require(originalEntry.contentHash))
+            let objectACL = try FileMetadata.aclText(at: storedObjectURL)
+            #expect(objectACL?.contains("everyone:12:allow:read") != true)
+            #expect(try FileMetadata.extendedAttributes(at: storedObjectURL, noFollow: false) == nil)
+
+            let updatedAttributeValue = Data("updated".utf8)
+            _ = updatedAttributeValue.withUnsafeBytes { bytes in
+                setxattr(
+                    fixture.repository.appending(path: "links/original.txt").path,
+                    "com.example.durepo-test",
+                    bytes.baseAddress,
+                    bytes.count,
+                    0,
+                    0
+                )
+            }
+            let metadataOnlySnapshot = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .smokeTest
+            )
+            let metadataDiff = try await store.snapshotDiff(id: metadataOnlySnapshot.id)
+            #expect(metadataDiff.entries.contains {
+                $0.relativePath == "links/original.txt" && $0.kind == .modified
+            })
+            _ = try await SnapshotRestorer(store: store).restore(manifest, to: fixture.restore)
+
+            let originalInfo = try fixture.restore.appending(path: "links/original.txt").lstatInfo()
+            let aliasInfo = try fixture.restore.appending(path: "links/alias.txt").lstatInfo()
+            #expect(originalInfo.st_ino == aliasInfo.st_ino)
+            let attributes = try FileMetadata.extendedAttributes(
+                at: fixture.restore.appending(path: "links/original.txt"),
+                noFollow: false
+            )
+            #expect(attributes?.contains {
+                $0.name == "com.example.durepo-test" && $0.value == attributeValue
+            } == true)
+            let restoredACL = try FileMetadata.aclText(
+                at: fixture.restore.appending(path: "links/original.txt")
+            )
+            #expect(restoredACL?.contains("everyone:12:allow:read") == true)
+            let restoredSparseInfo = try fixture.restore.appending(path: "sparse.bin").lstatInfo()
+            #expect(Int64(restoredSparseInfo.st_blocks) * 512 < Int64(restoredSparseInfo.st_size))
+        }
+    }
+
+    @Test("Integrity diagnostics find orphan objects and garbage collection reclaims them")
+    func integrityAndGarbageCollection() async throws {
+        try await withFixture { fixture in
+            try fixture.write("orphan me", to: "file.txt")
+            let repositoryID = UUID()
+            let store = SnapshotStore(storageURL: fixture.storage)
+            _ = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .smokeTest
+            )
+            _ = try await store.deleteSnapshots(repositoryID: repositoryID, mode: .keepObjects)
+
+            let report = try await store.checkIntegrity()
+            #expect(report.isHealthy)
+            #expect(report.orphanObjectCount == 1)
+            let collection = try await store.garbageCollect()
+            #expect(collection.deletedObjectCount == 1)
+            #expect(try await store.checkIntegrity().orphanObjectCount == 0)
+        }
+    }
+
+    @Test("Capacity retention prunes old unprotected snapshots and their orphan objects")
+    func capacityRetention() async throws {
+        try await withFixture { fixture in
+            let file = fixture.repository.appending(path: "large.bin")
+            try Data(repeating: 0x41, count: 800_000).write(to: file)
+            let repositoryID = UUID()
+            let store = SnapshotStore(
+                storageURL: fixture.storage,
+                retentionLimit: 50,
+                cloneFilesWhenSupported: false,
+                maximumStorageByteCount: 1_048_576
+            )
+            _ = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .smokeTest
+            )
+            try Data(repeating: 0x42, count: 800_000).write(to: file)
+            _ = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .smokeTest
+            )
+
+            #expect(try await store.snapshotSummaries(repositoryID: repositoryID).count == 1)
+            let report = try await store.checkIntegrity()
+            #expect(report.storedObjectCount == 1)
+            #expect(report.orphanObjectCount == 0)
+        }
+    }
+
+    @Test("Integrity diagnostics detect a corrupted content-addressed object")
+    func corruptedObjectDiagnostics() async throws {
+        try await withFixture { fixture in
+            try fixture.write("trusted", to: "file.txt")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let manifest = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: UUID(),
+                reason: .smokeTest
+            )
+            let hash = try #require(manifest.entries.first { $0.kind == .file }?.contentHash)
+            try Data("tampered".utf8).write(to: await store.objectURL(for: hash))
+
+            let report = try await store.checkIntegrity()
+            #expect(!report.isHealthy)
+            #expect(report.issues.contains { $0.message.contains("hash mismatch") })
+            await #expect(throws: DurepoError.self) { try await store.verify(manifest) }
+        }
+    }
+
+    @Test("In-place restore refuses a repository with an active Git lock")
+    func inPlaceRestoreGitLock() async throws {
+        try await withFixture { fixture in
+            try fixture.write("ref: refs/heads/main\n", to: ".git/HEAD")
+            try fixture.write("locked", to: ".git/index.lock")
+            try fixture.write("content", to: "file.txt")
+            let repositoryID = UUID()
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let manifest = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: repositoryID,
+                reason: .smokeTest
+            )
+            await #expect(throws: DurepoError.self) {
+                try await store.restoreInPlace(
+                    snapshotID: manifest.id,
+                    repositoryURL: fixture.repository,
+                    repositoryID: repositoryID,
+                    exclusionRules: .defaults
+                )
+            }
+            #expect(try await store.snapshotSummaries(repositoryID: repositoryID).count == 1)
         }
     }
 
