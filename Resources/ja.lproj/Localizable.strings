@@ -8,6 +8,7 @@
 "Launch at Login" = "ログイン時に起動";
 "Storage:" = "保存先:";
 "Durepo Settings" = "Durepo設定";
+"Background Protection Error" = "バックグラウンド保護エラー";
 "The background agent only accesses folders you explicitly choose." = "バックグラウンドエージェントは、明示的に選択したフォルダだけにアクセスします。";
 "Disable Agent" = "エージェントを無効化";
 "Enable Agent" = "エージェントを有効化";

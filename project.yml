@@ -30,6 +30,7 @@ targets:
         DEFINES_MODULE: YES
         SKIP_INSTALL: YES
         GENERATE_INFOPLIST_FILE: YES
+        OTHER_LDFLAGS: "$(inherited) -lsqlite3"
   DurepoAgent:
     type: tool
     platform: macOS

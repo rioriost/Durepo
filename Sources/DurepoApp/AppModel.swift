@@ -3,6 +3,7 @@ import DurepoCore
 import Foundation
 import Observation
 import ServiceManagement
+import UserNotifications
 
 struct AppAlert: Identifiable {
     let id = UUID()
@@ -21,7 +22,7 @@ enum AppSection: Hashable {
 final class AppModel {
     var selection: AppSection? = .dashboard
     var repositories: [RepositoryRecord] = []
-    var snapshots: [SnapshotManifest] = []
+    var snapshots: [SnapshotSummary] = []
     var selectedRepositoryID: UUID?
     var isBusy = false
     var progressDescription = ""
@@ -33,6 +34,7 @@ final class AppModel {
     private let registry: RepositoryRegistry
     private let store: SnapshotStore
     private var pendingAgentHandoffURLs: [UUID: URL] = [:]
+    private var presentedAgentErrorID: UUID?
 
     init() {
         let resolvedStorage: URL
@@ -54,21 +56,23 @@ final class AppModel {
         repositories.first { $0.id == selectedRepositoryID }
     }
 
-    var selectedSnapshots: [SnapshotManifest] {
+    var selectedSnapshots: [SnapshotSummary] {
         guard let selectedRepositoryID else { return snapshots }
         return snapshots.filter { $0.repositoryID == selectedRepositoryID }
     }
 
     func run() async {
+        _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
         await load()
         while !Task.isCancelled {
             do {
                 try await Task.sleep(for: .seconds(3))
-                let latestSnapshots = try await store.manifests()
+                let latestSnapshots = try await store.snapshotSummaries()
                 if latestSnapshots.map(\.id) != snapshots.map(\.id) {
                     snapshots = latestSnapshots
                 }
                 refreshServiceStatuses()
+                try await refreshAgentHealth()
             } catch is CancellationError {
                 return
             } catch {
@@ -82,11 +86,12 @@ final class AppModel {
             var loadedRepositories = try await registry.records()
             loadedRepositories = try await prepareAgentHandoffs(for: loadedRepositories)
             repositories = loadedRepositories.sorted { $0.displayName < $1.displayName }
-            snapshots = try await store.manifests()
+            snapshots = try await store.snapshotSummaries()
             if selectedRepositoryID == nil {
                 selectedRepositoryID = repositories.first?.id
             }
             refreshServiceStatuses()
+            try await refreshAgentHealth()
             scheduleAgentHandoffCleanup()
         } catch {
             present(error)
@@ -120,11 +125,16 @@ final class AppModel {
                 handoffBookmark: handoffBookmark
             )
             try await registry.add(record)
-            repositories.append(record)
-            repositories.sort { $0.displayName < $1.displayName }
-            selectedRepositoryID = record.id
-            selection = .repositories
-            try await snapshot(record, reason: .initial)
+            do {
+                try await snapshot(record, reason: .initial)
+                repositories.append(record)
+                repositories.sort { $0.displayName < $1.displayName }
+                selectedRepositoryID = record.id
+                selection = .repositories
+            } catch {
+                try? await registry.remove(id: record.id)
+                throw error
+            }
         } catch {
             present(error)
         }
@@ -150,7 +160,7 @@ final class AppModel {
         }
     }
 
-    func restore(_ manifest: SnapshotManifest) async {
+    func restore(_ summary: SnapshotSummary) async {
         let panel = NSOpenPanel()
         panel.title = String(localized: "Choose a parent folder for the restore")
         panel.prompt = String(localized: "Choose")
@@ -162,7 +172,7 @@ final class AppModel {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         let destination = parent.appending(
-            path: "\(manifest.repositoryName)-Durepo-\(formatter.string(from: manifest.createdAt))",
+            path: "\(summary.repositoryName)-Durepo-\(formatter.string(from: summary.createdAt))",
             directoryHint: .isDirectory
         )
         isBusy = true
@@ -172,6 +182,7 @@ final class AppModel {
             progressDescription = ""
         }
         do {
+            let manifest = try await store.manifest(id: summary.id)
             let didAccess = parent.startAccessingSecurityScopedResource()
             defer { if didAccess { parent.stopAccessingSecurityScopedResource() } }
             let restorer = SnapshotRestorer(store: store)
@@ -264,7 +275,7 @@ final class AppModel {
                 }
             }
         )
-        snapshots.insert(manifest, at: 0)
+        snapshots.insert(SnapshotSummary(manifest: manifest), at: 0)
     }
 
     private func prepareAgentHandoffs(for records: [RepositoryRecord]) async throws -> [RepositoryRecord] {
@@ -323,5 +334,11 @@ final class AppModel {
             title: String(localized: "Durepo Error"),
             message: error.localizedDescription
         )
+    }
+
+    private func refreshAgentHealth() async throws {
+        guard let health = try await store.agentHealth(), health.errorID != presentedAgentErrorID else { return }
+        presentedAgentErrorID = health.errorID
+        alert = AppAlert(title: String(localized: "Background Protection Error"), message: health.message)
     }
 }

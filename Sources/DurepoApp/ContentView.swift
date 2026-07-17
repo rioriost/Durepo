@@ -178,7 +178,7 @@ private struct SnapshotsView: View {
 
 private struct SnapshotTable: View {
     @Bindable var model: AppModel
-    let snapshots: [SnapshotManifest]
+    let snapshots: [SnapshotSummary]
 
     var body: some View {
         Table(snapshots) {

@@ -5,6 +5,14 @@
 > [plan-review.md](./plan-review.md) supersede older alternatives that remain as
 > historical context later in the document.
 
+> MVP 1 implementation status (2026-07-17): complete. SQLite WAL metadata,
+> resumable FSEvents batch state, retention, background error reporting, safe
+> restore, and generated-directory filtering are implemented. The automated
+> suite includes a 10,000-file deletion case; signed LaunchAgent restart and
+> crash-recovery behavior were also exercised on macOS 26. App Store Connect
+> submission and a physical Mac reboot remain release acceptance checks rather
+> than implementation work.
+
 ## 0. レビュー後の確定事項
 
 - 最低対応は **macOS 26 Tahoe / Apple Silicon** とする。macOS 27 はベータのため必須にせず、Xcode 27正式版で再検証する。

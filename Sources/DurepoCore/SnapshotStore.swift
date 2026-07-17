@@ -9,11 +9,18 @@ public actor SnapshotStore {
     private let temporaryURL: URL
     private let fileManager: FileManager
     private let excludedDirectoryNames: Set<String>
+    private let retentionLimit: Int
+    private let staleTemporaryAge: TimeInterval
+    private var metadata: SQLiteMetadata?
+    private var didReconcileMetadata = false
+    private var didCleanTemporaryFiles = false
 
     public init(
         storageURL: URL,
         fileManager: FileManager = .default,
-        excludedDirectoryNames: Set<String> = [".build", "DerivedData", "node_modules"]
+        excludedDirectoryNames: Set<String> = DurepoConstants.defaultExcludedDirectoryNames,
+        retentionLimit: Int = 50,
+        staleTemporaryAge: TimeInterval = 3_600
     ) {
         self.storageURL = storageURL.standardizedFileURL
         self.objectsURL = storageURL.appending(path: "objects", directoryHint: .isDirectory)
@@ -21,11 +28,24 @@ public actor SnapshotStore {
         self.temporaryURL = storageURL.appending(path: "temp", directoryHint: .isDirectory)
         self.fileManager = fileManager
         self.excludedDirectoryNames = excludedDirectoryNames
+        self.retentionLimit = max(1, retentionLimit)
+        self.staleTemporaryAge = staleTemporaryAge
     }
 
     public func prepare() throws {
         for directory in [storageURL, objectsURL, manifestsURL, temporaryURL] {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        if !didCleanTemporaryFiles {
+            try removeStaleTemporaryFiles()
+            didCleanTemporaryFiles = true
+        }
+        if metadata == nil {
+            metadata = try SQLiteMetadata(url: storageURL.appending(path: "metadata.sqlite"))
+        }
+        if !didReconcileMetadata {
+            try reconcileMetadata()
+            didReconcileMetadata = true
         }
     }
 
@@ -142,21 +162,63 @@ public actor SnapshotStore {
         )
         let manifestURL = manifestsURL.appending(path: "\(manifest.id.uuidString).json")
         try AtomicFileWriter.write(JSONEncoder.durepo.encode(manifest), to: manifestURL, fileManager: fileManager)
+        try metadataStore.index(manifest, manifestFile: manifestURL.lastPathComponent)
+        try applyRetention(to: repositoryID)
         return manifest
     }
 
-    public func manifests(repositoryID: UUID? = nil) throws -> [SnapshotManifest] {
+    public func snapshotSummaries(repositoryID: UUID? = nil, limit: Int = 200) throws -> [SnapshotSummary] {
         try prepare()
-        let urls = try fileManager.contentsOfDirectory(
-            at: manifestsURL,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )
-        return urls
-            .filter { $0.pathExtension == "json" }
-            .compactMap { try? JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: $0)) }
-            .filter { repositoryID == nil || $0.repositoryID == repositoryID }
-            .sorted { $0.createdAt > $1.createdAt }
+        return try metadataStore.summaries(repositoryID: repositoryID, limit: max(1, limit))
+    }
+
+    public func manifest(id: UUID) throws -> SnapshotManifest {
+        try prepare()
+        guard let file = try metadataStore.manifestFile(id: id) else {
+            throw DurepoError.corruptManifest(id.uuidString)
+        }
+        let url = manifestsURL.appending(path: file)
+        do {
+            return try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+        } catch {
+            throw DurepoError.corruptManifest(url.path)
+        }
+    }
+
+    public func prepareMonitor(repositoryID: UUID, volumeID: String, rootID: String) throws -> RepositoryMonitorState {
+        try prepare()
+        return try metadataStore.prepareMonitor(repositoryID: repositoryID, volumeID: volumeID, rootID: rootID)
+    }
+
+    public func recordEvent(repositoryID: UUID, eventID: UInt64, flags: UInt64, needsFullScan: Bool) throws {
+        try prepare()
+        try metadataStore.recordEvent(repositoryID: repositoryID, eventID: eventID, flags: flags, needsFullScan: needsFullScan)
+    }
+
+    public func monitorState(repositoryID: UUID) throws -> RepositoryMonitorState? {
+        try prepare()
+        return try metadataStore.monitorState(repositoryID: repositoryID)
+    }
+
+    public func commitEvents(repositoryID: UUID, through eventID: UInt64) throws -> RepositoryMonitorState {
+        try prepare()
+        return try metadataStore.commitEvents(repositoryID: repositoryID, through: eventID)
+    }
+
+    @discardableResult
+    public func recordAgentError(repositoryID: UUID, message: String) throws -> AgentHealth {
+        try prepare()
+        return try metadataStore.recordAgentError(repositoryID: repositoryID, message: message)
+    }
+
+    public func clearAgentError(repositoryID: UUID) throws {
+        try prepare()
+        try metadataStore.clearAgentError(repositoryID: repositoryID)
+    }
+
+    public func agentHealth() throws -> AgentHealth? {
+        try prepare()
+        return try metadataStore.agentHealth()
     }
 
     public func verify(_ manifest: SnapshotManifest) throws {
@@ -205,6 +267,7 @@ public actor SnapshotStore {
                             throw error
                         }
                     }
+                    try Self.synchronizeDirectory(destination.deletingLastPathComponent())
                 }
                 return result
             } catch DurepoError.fileChangedDuringRead where attempt == 0 {
@@ -278,6 +341,69 @@ public actor SnapshotStore {
             hasher.update(data: data)
         }
         return hasher.finalize().hexString
+    }
+
+    private var metadataStore: SQLiteMetadata {
+        get throws {
+            guard let metadata else { throw CocoaError(.fileReadUnknown) }
+            return metadata
+        }
+    }
+
+    private func reconcileMetadata() throws {
+        let urls = try fileManager.contentsOfDirectory(at: manifestsURL, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+        for url in urls {
+            guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent) else { continue }
+            if try metadataStore.containsSnapshot(id: id) { continue }
+            do {
+                let manifest = try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+                try metadataStore.index(manifest, manifestFile: url.lastPathComponent)
+            } catch {
+                throw DurepoError.corruptManifest(url.path)
+            }
+        }
+        for repositoryID in try metadataStore.repositoryIDs() {
+            try applyRetention(to: repositoryID)
+        }
+    }
+
+    private func applyRetention(to repositoryID: UUID) throws {
+        let files = try metadataStore.prune(repositoryID: repositoryID, keeping: retentionLimit)
+        for file in files {
+            let url = manifestsURL.appending(path: file)
+            guard fileManager.fileExists(atPath: url.path) else { continue }
+            do {
+                try fileManager.removeItem(at: url)
+            } catch {
+                guard !fileManager.fileExists(atPath: url.path) else { throw error }
+            }
+        }
+        if !files.isEmpty { try Self.synchronizeDirectory(manifestsURL) }
+    }
+
+    private func removeStaleTemporaryFiles() throws {
+        let cutoff = Date().addingTimeInterval(-staleTemporaryAge)
+        let urls = try fileManager.contentsOfDirectory(
+            at: temporaryURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )
+        for url in urls {
+            let values = try url.resourceValues(forKeys: [.contentModificationDateKey])
+            if values.contentModificationDate.map({ $0 < cutoff }) ?? false {
+                try fileManager.removeItem(at: url)
+            }
+        }
+    }
+
+    static func synchronizeDirectory(_ directory: URL) throws {
+        let descriptor = Darwin.open(directory.path, O_RDONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { Darwin.close(descriptor) }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 }
 

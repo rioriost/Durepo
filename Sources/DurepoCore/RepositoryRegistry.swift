@@ -86,6 +86,7 @@ enum AtomicFileWriter {
             } else {
                 try fileManager.moveItem(at: temporaryURL, to: destination)
             }
+            try SnapshotStore.synchronizeDirectory(directory)
         } catch {
             try? fileManager.removeItem(at: temporaryURL)
             throw error

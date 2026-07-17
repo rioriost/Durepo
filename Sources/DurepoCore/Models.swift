@@ -4,6 +4,10 @@ public enum DurepoConstants {
     public static let appGroupIdentifier = "23889H77KX.st.rio.Durepo"
     public static let agentPlistName = "st.rio.Durepo.Agent.plist"
     public static let formatVersion = 1
+    public static let defaultExcludedDirectoryNames: Set<String> = [
+        ".build", ".cache", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv",
+        "DerivedData", "__pycache__", "build", "coverage", "dist", "node_modules", "target", "venv",
+    ]
 }
 
 public struct RepositoryRecord: Codable, Identifiable, Hashable, Sendable {
@@ -114,6 +118,57 @@ public struct SnapshotManifest: Codable, Identifiable, Sendable {
     }
 }
 
+public struct SnapshotSummary: Identifiable, Hashable, Sendable {
+    public let id: UUID
+    public let repositoryID: UUID
+    public let repositoryName: String
+    public let createdAt: Date
+    public let reason: SnapshotReason
+    public let fileCount: Int
+    public let logicalByteCount: Int64
+
+    public init(manifest: SnapshotManifest) {
+        id = manifest.id
+        repositoryID = manifest.repositoryID
+        repositoryName = manifest.repositoryName
+        createdAt = manifest.createdAt
+        reason = manifest.reason
+        fileCount = manifest.fileCount
+        logicalByteCount = manifest.logicalByteCount
+    }
+
+    public init(
+        id: UUID,
+        repositoryID: UUID,
+        repositoryName: String,
+        createdAt: Date,
+        reason: SnapshotReason,
+        fileCount: Int,
+        logicalByteCount: Int64
+    ) {
+        self.id = id
+        self.repositoryID = repositoryID
+        self.repositoryName = repositoryName
+        self.createdAt = createdAt
+        self.reason = reason
+        self.fileCount = fileCount
+        self.logicalByteCount = logicalByteCount
+    }
+}
+
+public struct RepositoryMonitorState: Sendable {
+    public let lastSeenEventID: UInt64
+    public let lastCommittedEventID: UInt64
+    public let hasPendingEvents: Bool
+    public let needsFullScan: Bool
+}
+
+public struct AgentHealth: Sendable, Equatable {
+    public let errorID: UUID
+    public let message: String
+    public let updatedAt: Date
+}
+
 public struct SnapshotProgress: Sendable {
     public let filesProcessed: Int
     public let bytesProcessed: Int64
@@ -137,6 +192,7 @@ public enum DurepoError: Error, LocalizedError, Sendable {
     case destinationExists(String)
     case bookmarkAccessDenied
     case unsupportedFormat(Int)
+    case corruptManifest(String)
 
     public var errorDescription: String? {
         switch self {
@@ -150,6 +206,7 @@ public enum DurepoError: Error, LocalizedError, Sendable {
         case .destinationExists(let path): localized("Restore destination already exists: %@", path)
         case .bookmarkAccessDenied: localized("Access to the selected folder was denied.")
         case .unsupportedFormat(let version): localized("Unsupported snapshot format: %lld", Int64(version))
+        case .corruptManifest(let path): localized("Snapshot manifest is corrupted: %@", path)
         }
     }
 

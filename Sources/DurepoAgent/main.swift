@@ -2,6 +2,7 @@ import CoreServices
 import DurepoCore
 import Foundation
 import OSLog
+import UserNotifications
 
 private let logger = Logger(subsystem: "st.rio.Durepo", category: "agent")
 
@@ -55,15 +56,49 @@ private actor AgentCoordinator {
         for record in records where sessions[record.id] == nil {
             do {
                 let (agentRecord, url) = try await resolveRepository(record)
-                let watcher = try FSEventWatcher(url: url) { [weak self] in
+                let identity = try repositoryIdentity(at: url)
+                let state = try await store.prepareMonitor(
+                    repositoryID: record.id,
+                    volumeID: identity.volumeID,
+                    rootID: identity.rootID
+                )
+                let sinceWhen = state.lastCommittedEventID == 0
+                    ? FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+                    : FSEventStreamEventId(state.lastCommittedEventID)
+                let watcher = try FSEventWatcher(url: url, sinceWhen: sinceWhen) { [weak self] batch in
                     guard let self else { return }
-                    Task { await self.scheduleSnapshot(for: record.id) }
+                    Task { await self.record(batch, for: record.id) }
                 }
                 sessions[record.id] = RepositorySession(record: agentRecord, url: url, watcher: watcher)
                 logger.info("Monitoring \(agentRecord.displayName, privacy: .private)")
+                if state.hasPendingEvents || state.needsFullScan {
+                    Task { [weak self] in await self?.createSnapshot(for: record.id) }
+                }
             } catch {
                 logger.error("Unable to monitor \(record.displayName, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
+        }
+    }
+
+    private func repositoryIdentity(at url: URL) throws -> (volumeID: String, rootID: String) {
+        let values = try url.resourceValues(forKeys: [.volumeUUIDStringKey, .fileResourceIdentifierKey])
+        return (
+            values.volumeUUIDString ?? "unknown-volume",
+            values.fileResourceIdentifier.map { String(describing: $0) } ?? url.standardizedFileURL.path
+        )
+    }
+
+    private func record(_ batch: FSEventBatch, for repositoryID: UUID) async {
+        do {
+            try await store.recordEvent(
+                repositoryID: repositoryID,
+                eventID: batch.lastEventID,
+                flags: batch.flags,
+                needsFullScan: batch.needsFullScan
+            )
+            scheduleSnapshot(for: repositoryID)
+        } catch {
+            await report(error, repositoryID: repositoryID)
         }
     }
 
@@ -143,15 +178,53 @@ private actor AgentCoordinator {
         guard !snapshotting.contains(repositoryID), let session = sessions[repositoryID] else { return }
         snapshotting.insert(repositoryID)
         defer { snapshotting.remove(repositoryID) }
+        while !Task.isCancelled {
+            do {
+                let state = try await store.monitorState(repositoryID: repositoryID)
+                let targetEventID = state?.lastSeenEventID ?? 0
+                let manifest = try await store.createSnapshot(
+                    repositoryURL: session.url,
+                    repositoryID: session.record.id,
+                    reason: .fileSystemEvent
+                )
+                let committed = try await store.commitEvents(repositoryID: repositoryID, through: targetEventID)
+                try await store.clearAgentError(repositoryID: repositoryID)
+                logger.info("Created snapshot \(manifest.id.uuidString, privacy: .public) through event \(targetEventID)")
+                guard committed.hasPendingEvents else { return }
+                logger.info("Changes arrived during snapshot; rescanning \(session.record.displayName, privacy: .private)")
+            } catch {
+                await report(error, repositoryID: repositoryID)
+                scheduleRetry(for: repositoryID)
+                return
+            }
+        }
+    }
+
+    private func scheduleRetry(for repositoryID: UUID) {
+        debounceTasks[repositoryID]?.cancel()
+        debounceTasks[repositoryID] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(30))
+            await self?.finishDebouncedSnapshot(for: repositoryID)
+        }
+    }
+
+    private func report(_ error: Error, repositoryID: UUID) async {
+        let message = error.localizedDescription
+        logger.error("Snapshot failed for \(repositoryID.uuidString, privacy: .public): \(message, privacy: .public)")
         do {
-            let manifest = try await store.createSnapshot(
-                repositoryURL: session.url,
-                repositoryID: session.record.id,
-                reason: .fileSystemEvent
+            let health = try await store.recordAgentError(repositoryID: repositoryID, message: message)
+            let content = UNMutableNotificationContent()
+            content.title = "Durepo"
+            content.body = message
+            content.sound = .default
+            let request = UNNotificationRequest(
+                identifier: "durepo-agent-\(health.errorID.uuidString)",
+                content: content,
+                trigger: nil
             )
-            logger.info("Created snapshot \(manifest.id.uuidString, privacy: .public)")
+            try await UNUserNotificationCenter.current().add(request)
         } catch {
-            logger.error("Snapshot failed: \(error.localizedDescription, privacy: .public)")
+            logger.error("Unable to publish agent error: \(error.localizedDescription, privacy: .public)")
         }
     }
 }
@@ -172,12 +245,74 @@ private final class RepositorySession: @unchecked Sendable {
     }
 }
 
+private struct FSEventBatch: Sendable {
+    let lastEventID: UInt64
+    let flags: UInt64
+    let needsFullScan: Bool
+}
+
+private let mutationEventFlags: FSEventStreamEventFlags = [
+    kFSEventStreamEventFlagItemCreated,
+    kFSEventStreamEventFlagItemRemoved,
+    kFSEventStreamEventFlagItemRenamed,
+    kFSEventStreamEventFlagItemModified,
+    kFSEventStreamEventFlagItemInodeMetaMod,
+    kFSEventStreamEventFlagItemFinderInfoMod,
+    kFSEventStreamEventFlagItemChangeOwner,
+    kFSEventStreamEventFlagItemXattrMod,
+    kFSEventStreamEventFlagMustScanSubDirs,
+    kFSEventStreamEventFlagRootChanged,
+    kFSEventStreamEventFlagUserDropped,
+    kFSEventStreamEventFlagKernelDropped,
+    kFSEventStreamEventFlagEventIdsWrapped,
+].reduce(FSEventStreamEventFlags(0)) { $0 | FSEventStreamEventFlags($1) }
+
+private let fullScanEventFlags: FSEventStreamEventFlags = [
+    kFSEventStreamEventFlagMustScanSubDirs,
+    kFSEventStreamEventFlagRootChanged,
+    kFSEventStreamEventFlagUserDropped,
+    kFSEventStreamEventFlagKernelDropped,
+    kFSEventStreamEventFlagEventIdsWrapped,
+].reduce(FSEventStreamEventFlags(0)) { $0 | FSEventStreamEventFlags($1) }
+
+nonisolated(unsafe) private let durepoFSEventCallback: FSEventStreamCallback = {
+    _, contextInfo, eventCount, eventPaths, eventFlags, eventIDs in
+    guard let contextInfo, eventCount > 0 else { return }
+    let watcher = Unmanaged<FSEventWatcher>.fromOpaque(contextInfo).takeUnretainedValue()
+    let flagBuffer = UnsafeBufferPointer(start: eventFlags, count: eventCount)
+    let idBuffer = UnsafeBufferPointer(start: eventIDs, count: eventCount)
+    let pathBuffer = eventPaths.assumingMemoryBound(to: UnsafePointer<CChar>?.self)
+    var combinedFlags = FSEventStreamEventFlags(0)
+    var lastRelevantEventID = FSEventStreamEventId(0)
+    for index in 0..<eventCount {
+        let flag = flagBuffer[index]
+        let mustReconcile = flag & fullScanEventFlags != 0
+        let path = pathBuffer[index].map(String.init(cString:)) ?? ""
+        guard mustReconcile || !watcher.ignores(path: path) else { continue }
+        combinedFlags |= flag
+        lastRelevantEventID = max(lastRelevantEventID, idBuffer[index])
+    }
+    guard combinedFlags & mutationEventFlags != 0 else { return }
+    watcher.deliver(FSEventBatch(
+        lastEventID: UInt64(lastRelevantEventID),
+        flags: UInt64(combinedFlags),
+        needsFullScan: combinedFlags & fullScanEventFlags != 0
+    ))
+}
+
 private final class FSEventWatcher: @unchecked Sendable {
     private var stream: FSEventStreamRef?
-    private let onChange: @Sendable () -> Void
+    private let onChange: @Sendable (FSEventBatch) -> Void
+    private let rootPath: String
+    private let excludedDirectoryNames = DurepoConstants.defaultExcludedDirectoryNames
 
-    init(url: URL, onChange: @escaping @Sendable () -> Void) throws {
+    init(
+        url: URL,
+        sinceWhen: FSEventStreamEventId,
+        onChange: @escaping @Sendable (FSEventBatch) -> Void
+    ) throws {
         self.onChange = onChange
+        rootPath = url.standardizedFileURL.path
         var context = FSEventStreamContext(
             version: 0,
             info: Unmanaged.passUnretained(self).toOpaque(),
@@ -192,26 +327,10 @@ private final class FSEventWatcher: @unchecked Sendable {
         )
         guard let created = FSEventStreamCreate(
             nil,
-            { _, contextInfo, eventCount, _, eventFlags, _ in
-                guard let contextInfo else { return }
-                let watcher = Unmanaged<FSEventWatcher>.fromOpaque(contextInfo).takeUnretainedValue()
-                let flags = UnsafeBufferPointer(start: eventFlags, count: eventCount)
-                if flags.contains(where: { flag in
-                    flag & FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemCreated
-                            | kFSEventStreamEventFlagItemRemoved
-                            | kFSEventStreamEventFlagItemRenamed
-                            | kFSEventStreamEventFlagItemModified
-                            | kFSEventStreamEventFlagMustScanSubDirs
-                            | kFSEventStreamEventFlagRootChanged
-                    ) != 0
-                }) {
-                    watcher.onChange()
-                }
-            },
+            durepoFSEventCallback,
             &context,
             [url.path] as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            sinceWhen,
             1.0,
             flags
         ) else {
@@ -224,6 +343,16 @@ private final class FSEventWatcher: @unchecked Sendable {
             FSEventStreamRelease(created)
             stream = nil
             throw CocoaError(.fileReadUnknown)
+        }
+    }
+
+    func deliver(_ batch: FSEventBatch) { onChange(batch) }
+
+    func ignores(path: String) -> Bool {
+        guard path.hasPrefix(rootPath + "/") else { return false }
+        let relative = path.dropFirst(rootPath.count + 1)
+        return relative.split(separator: "/").contains {
+            excludedDirectoryNames.contains(String($0))
         }
     }
 

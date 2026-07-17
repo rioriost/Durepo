@@ -35,7 +35,7 @@ public actor SnapshotRestorer {
                 try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
             }
 
-            for entry in manifest.entries where entry.kind == .file {
+            for entry in manifest.entries where entry.kind == .file && !entry.isGitLockFile {
                 guard let hash = entry.contentHash else { throw DurepoError.missingObject(entry.relativePath) }
                 let objectURL = await store.objectURL(for: hash)
                 let target = try targetURL(for: entry.relativePath, under: temporaryURL)
@@ -107,4 +107,11 @@ public actor SnapshotRestorer {
 
 private extension String {
     var pathDepth: Int { split(separator: "/").count }
+}
+
+private extension SnapshotEntry {
+    var isGitLockFile: Bool {
+        let components = relativePath.split(separator: "/")
+        return components.contains(".git") && components.last?.hasSuffix(".lock") == true
+    }
 }

@@ -13,7 +13,8 @@ let package = Package(
         .target(
             name: "DurepoCore",
             path: "Sources/DurepoCore",
-            resources: [.process("Resources")]
+            resources: [.process("Resources")],
+            linkerSettings: [.linkedLibrary("sqlite3")]
         ),
         .executableTarget(
             name: "DurepoSmoke",
