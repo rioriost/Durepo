@@ -64,25 +64,119 @@ struct SnapshotStoreTests {
         #expect(try store.rules().isEmpty)
     }
 
-    @Test("Repository optimizer suggests generated paths without importing gitignore")
+    @Test("Repository optimizer uses ecosystem evidence without importing gitignore")
     func repositoryExclusionOptimization() async throws {
         try await withFixture { fixture in
+            try fixture.write(#"{"dependencies":{"next":"latest"}}"#, to: "web/package.json")
             try fixture.write("dependency", to: "web/node_modules/package/index.js")
+            try fixture.write("output", to: "web/.next/server/app.js")
+            try fixture.write("[project]\nname = \"sample\"\n", to: "pyproject.toml")
             try fixture.write("cache", to: ".venv/lib/cache.py")
             try fixture.write("metadata", to: ".DS_Store")
-            try fixture.write("node_modules/\n", to: ".gitignore")
+            try fixture.write("local-only/\n", to: ".gitignore")
 
             let optimizer = RepositoryExclusionOptimizer()
-            let rules = try await optimizer.optimizedRules(
+            let result = try await optimizer.optimize(
                 repositoryURL: fixture.repository,
                 including: ["*.log"]
             )
 
-            #expect(rules.first == "*.log")
-            #expect(rules.contains("web/node_modules/"))
-            #expect(rules.contains(".venv/"))
-            #expect(rules.contains(".DS_Store"))
-            #expect(!rules.contains("node_modules/"))
+            #expect(result.rules.first == "*.log")
+            #expect(result.rules.contains("web/node_modules/"))
+            #expect(result.rules.contains("web/.next/"))
+            #expect(result.rules.contains(".venv/"))
+            #expect(result.rules.contains(".DS_Store"))
+            #expect(!result.rules.contains("local-only/"))
+            #expect(result.detectedTechnologies.contains("Node.js"))
+            #expect(result.detectedTechnologies.contains("Next.js"))
+            #expect(result.detectedTechnologies.contains("Python"))
+        }
+    }
+
+    @Test("Repository optimizer does not infer a generic output directory without an ecosystem marker")
+    func repositoryExclusionOptimizationRequiresEvidence() async throws {
+        try await withFixture { fixture in
+            try fixture.write("valuable", to: "target/report.txt")
+
+            let result = try await RepositoryExclusionOptimizer().optimize(
+                repositoryURL: fixture.repository,
+                including: []
+            )
+
+            #expect(result.rules.isEmpty)
+            #expect(result.detectedTechnologies.isEmpty)
+        }
+    }
+
+    @Test("Repository optimizer never suggests a rule that matches Git-tracked content")
+    func repositoryExclusionOptimizationProtectsTrackedContent() async throws {
+        try await withFixture { fixture in
+            try fixture.write(#"{"name":"tracked-dependency"}"#, to: "package.json")
+            try fixture.write("valuable", to: "node_modules/local/index.js")
+            try fixture.runGit(["init", "--quiet"])
+            try fixture.runGit(["add", "package.json", "node_modules/local/index.js"])
+
+            let result = try await RepositoryExclusionOptimizer().optimize(
+                repositoryURL: fixture.repository,
+                including: []
+            )
+
+            #expect(!result.rules.contains("node_modules/"))
+            #expect(result.trackedSuggestionCount == 1)
+            #expect(!result.gitTrackingVerificationFailed)
+        }
+    }
+
+    @Test("Repository optimizer does not duplicate a broader existing rule")
+    func repositoryExclusionOptimizationAvoidsSemanticDuplicates() async throws {
+        try await withFixture { fixture in
+            try fixture.write(#"{"name":"workspace"}"#, to: "web/package.json")
+            try fixture.write("dependency", to: "web/node_modules/package/index.js")
+
+            let result = try await RepositoryExclusionOptimizer().optimize(
+                repositoryURL: fixture.repository,
+                including: ["node_modules/"]
+            )
+
+            #expect(result.rules == ["node_modules/"])
+            #expect(result.suggestions.isEmpty)
+        }
+    }
+
+    @Test("Repository optimizer preserves existing negation intent")
+    func repositoryExclusionOptimizationPreservesNegation() async throws {
+        try await withFixture { fixture in
+            try fixture.write(#"{"name":"workspace"}"#, to: "package.json")
+            try fixture.write("valuable", to: "node_modules/local/index.js")
+
+            let result = try await RepositoryExclusionOptimizer().optimize(
+                repositoryURL: fixture.repository,
+                including: ["!node_modules/local/index.js"]
+            )
+
+            #expect(result.rules == ["!node_modules/local/index.js"])
+            #expect(result.suggestions.isEmpty)
+        }
+    }
+
+    @Test("Repository optimizer fails closed when a Git index cannot be verified")
+    func repositoryExclusionOptimizationFailsClosed() async throws {
+        try await withFixture { fixture in
+            try fixture.write(#"{"name":"broken-git"}"#, to: "package.json")
+            try fixture.write("dependency", to: "node_modules/package/index.js")
+            try FileManager.default.createDirectory(
+                at: fixture.repository.appending(path: ".git"),
+                withIntermediateDirectories: true
+            )
+
+            let result = try await RepositoryExclusionOptimizer().optimize(
+                repositoryURL: fixture.repository,
+                including: ["*.log"]
+            )
+
+            #expect(result.rules == ["*.log"])
+            #expect(result.suggestions.isEmpty)
+            #expect(result.gitTrackingVerificationFailed)
         }
     }
 
@@ -969,6 +1063,19 @@ private struct Fixture: Sendable {
         let url = repository.appending(path: relativePath)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(contents.utf8).write(to: url)
+    }
+
+    func runGit(_ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", repository.path] + arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw CocoaError(.fileReadUnknown)
+        }
     }
 
     func cleanup() {

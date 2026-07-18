@@ -69,6 +69,13 @@
 "Verifying and restoring…" = "Verifying and restoring…";
 "Preparing snapshot…" = "Preparing snapshot…";
 "Optimizing exclusion rules…" = "Optimizing exclusion rules…";
+"No new exclusion rules were suggested." = "No new exclusion rules were suggested.";
+"%lld exclusion rules were suggested." = "%lld exclusion rules were suggested.";
+"%lld suggestions were skipped because they match Git-tracked content." = "%lld suggestions were skipped because they match Git-tracked content.";
+"Git tracking information could not be verified, so no rules were added." = "Git tracking information could not be verified, so no rules were added.";
+"The repository scan reached its safety limit; suggestions may be incomplete." = "The repository scan reached its safety limit; suggestions may be incomplete.";
+"High confidence" = "High confidence";
+"Medium confidence" = "Medium confidence";
 "%lld files • %@" = "%lld files • %@";
 "Durepo Error" = "Durepo Error";
 "Destructive Change Detected" = "Destructive Change Detected";

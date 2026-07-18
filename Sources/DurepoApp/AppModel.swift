@@ -136,10 +136,12 @@ final class AppModel {
             progressDescription = String(localized: "Optimizing exclusion rules…")
             let optimizedRules: [String]
             do {
-                optimizedRules = try await exclusionOptimizer.optimizedRules(
+                let optimization = try await exclusionOptimizer.optimize(
                     repositoryURL: url,
-                    including: globalExclusionRules
+                    including: globalExclusionRules,
+                    minimumConfidence: .high
                 )
+                optimizedRules = optimization.rules
             } catch {
                 isBusy = false
                 progressDescription = ""
@@ -352,7 +354,10 @@ final class AppModel {
         }
     }
 
-    func optimizedExclusionRules(for record: RepositoryRecord, existingRules: [String]) async -> [String]? {
+    func optimizedExclusionRules(
+        for record: RepositoryRecord,
+        existingRules: [String]
+    ) async -> RepositoryExclusionOptimizationResult? {
         do {
             var stale = false
             let url = try URL(
@@ -365,9 +370,10 @@ final class AppModel {
                 throw DurepoError.bookmarkAccessDenied
             }
             defer { url.stopAccessingSecurityScopedResource() }
-            return try await exclusionOptimizer.optimizedRules(
+            return try await exclusionOptimizer.optimize(
                 repositoryURL: url,
-                including: existingRules
+                including: existingRules,
+                minimumConfidence: .medium
             )
         } catch {
             present(error)

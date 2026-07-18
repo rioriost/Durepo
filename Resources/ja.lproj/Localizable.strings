@@ -69,6 +69,13 @@
 "Verifying and restoring…" = "検証して復元しています…";
 "Preparing snapshot…" = "スナップショットを準備しています…";
 "Optimizing exclusion rules…" = "除外ルールを最適化しています…";
+"No new exclusion rules were suggested." = "新しく提案する除外ルールはありません。";
+"%lld exclusion rules were suggested." = "%lld件の除外ルールを提案しました。";
+"%lld suggestions were skipped because they match Git-tracked content." = "Gitで追跡中の内容に一致するため、%lld件の候補を見送りました。";
+"Git tracking information could not be verified, so no rules were added." = "Gitの追跡情報を確認できなかったため、ルールを追加しませんでした。";
+"The repository scan reached its safety limit; suggestions may be incomplete." = "リポジトリ走査が安全上限に達したため、候補が不完全な可能性があります。";
+"High confidence" = "確信度：高";
+"Medium confidence" = "確信度：中";
 "%lld files • %@" = "%lldファイル • %@";
 "Durepo Error" = "Durepoエラー";
 "Destructive Change Detected" = "破壊的な変更を検知しました";

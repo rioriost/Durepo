@@ -213,18 +213,19 @@ private struct RepositoriesView: View {
 private struct RepositoryExclusionRulesDialog: View {
     let repository: RepositoryRecord
     let cancel: () -> Void
-    let optimize: ([String]) async -> [String]?
+    let optimize: ([String]) async -> RepositoryExclusionOptimizationResult?
     let save: ([String]) async -> Void
 
     @State private var rules: [String]
     @State private var isOptimizing = false
     @State private var isSaving = false
+    @State private var optimizationResult: RepositoryExclusionOptimizationResult?
 
     init(
         repository: RepositoryRecord,
         initialRules: [String],
         cancel: @escaping () -> Void,
-        optimize: @escaping ([String]) async -> [String]?,
+        optimize: @escaping ([String]) async -> RepositoryExclusionOptimizationResult?,
         save: @escaping ([String]) async -> Void
     ) {
         self.repository = repository
@@ -250,12 +251,19 @@ private struct RepositoryExclusionRulesDialog: View {
                 optimize: {
                     isOptimizing = true
                     Task {
-                        if let optimized = await optimize(rules) { rules = optimized }
+                        if let result = await optimize(rules) {
+                            rules = result.rules
+                            optimizationResult = result
+                        }
                         isOptimizing = false
                     }
                 }
             )
-            .frame(minHeight: 260)
+            .frame(minHeight: 230)
+
+            if let optimizationResult {
+                ExclusionOptimizationSummary(result: optimizationResult)
+            }
 
             Divider()
 
@@ -275,8 +283,83 @@ private struct RepositoryExclusionRulesDialog: View {
             }
         }
         .padding(24)
-        .frame(width: 680, height: 500)
+        .frame(width: 680, height: 600)
         .interactiveDismissDisabled()
+    }
+}
+
+private struct ExclusionOptimizationSummary: View {
+    let result: RepositoryExclusionOptimizationResult
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if result.suggestions.isEmpty {
+                Text("No new exclusion rules were suggested.")
+                    .font(.callout.weight(.medium))
+            } else {
+                Text(String(
+                    format: String(localized: "%lld exclusion rules were suggested."),
+                    Int64(result.suggestions.count)
+                ))
+                .font(.callout.weight(.medium))
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(result.suggestions, id: \.self) { suggestion in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(suggestion.rule)
+                                    .font(.system(.caption, design: .monospaced))
+                                Spacer(minLength: 8)
+                                Text("\(suggestion.technology) • \(suggestion.evidence) • \(suggestion.confidence.localizedTitle)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .multilineTextAlignment(.trailing)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 82)
+            }
+
+            if result.trackedSuggestionCount > 0 {
+                Label(
+                    String(
+                        format: String(localized: "%lld suggestions were skipped because they match Git-tracked content."),
+                        Int64(result.trackedSuggestionCount)
+                    ),
+                    systemImage: "checkmark.shield"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            if result.gitTrackingVerificationFailed {
+                Label(
+                    "Git tracking information could not be verified, so no rules were added.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
+            if result.scanWasLimited {
+                Label(
+                    "The repository scan reached its safety limit; suggestions may be incomplete.",
+                    systemImage: "info.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private extension ExclusionSuggestionConfidence {
+    var localizedTitle: String {
+        switch self {
+        case .high: String(localized: "High confidence")
+        case .medium: String(localized: "Medium confidence")
+        }
     }
 }
 

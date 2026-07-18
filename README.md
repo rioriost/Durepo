@@ -2,7 +2,7 @@
 
 Durepo is a macOS repository snapshot and recovery utility for protecting Git metadata, uncommitted changes, and untracked files from accidental destructive operations.
 
-The `1.0.0` implementation covers the reviewed MVP 1, MVP 2, and local-recovery portions of the Version 1.0 scope. It is designed for recovery from accidental local damage, not as a tamper-proof or offline backup. It includes:
+The `1.0.1` implementation covers the reviewed MVP 1, MVP 2, and local-recovery portions of the Version 1.0 scope. It is designed for recovery from accidental local damage, not as a tamper-proof or offline backup. It includes:
 
 - a SwiftUI dashboard with English and Japanese localization;
 - user-selected repository access through security-scoped bookmarks;
@@ -16,6 +16,7 @@ The `1.0.0` implementation covers the reviewed MVP 1, MVP 2, and local-recovery 
 - English/Japanese SwiftUI and menu-bar interfaces;
 - an FSEvents LaunchAgent embedded and managed with `SMAppService`;
 - persisted background errors with macOS notifications and GUI alerts;
+- local, ecosystem-aware exclusion suggestions selected from manifest and tool configuration evidence, with Git-tracked-path protection and confidence reporting;
 - App Sandbox, App Group, Hardened Runtime, App Store export, and Developer ID notarization configuration.
 - privacy manifests declaring the required reasons for file metadata, elapsed-time, and disk-space APIs.
 
@@ -61,6 +62,8 @@ Support and bug reports: [GitHub Issues](https://github.com/rioriost/Durepo/issu
 
 ## 日本語
 
-Durepoは、誤操作による大量削除などから、`.git`、未コミット変更、未追跡ファイルを復旧するためのmacOS向けスナップショットツールです。`1.0.0`はレビュー済みのMVP 1・MVP 2と、ローカル復旧に関するVersion 1.0範囲を実装していますが、改ざん耐性のあるバックアップやオフラインバックアップの代替ではありません。
+Durepoは、誤操作による大量削除などから、`.git`、未コミット変更、未追跡ファイルを復旧するためのmacOS向けスナップショットツールです。`1.0.1`はレビュー済みのMVP 1・MVP 2と、ローカル復旧に関するVersion 1.0範囲を実装していますが、改ざん耐性のあるバックアップやオフラインバックアップの代替ではありません。
+
+`1.0.1`では、マニフェストとツール設定をローカルで検出し、実在するキャッシュ・生成物だけを除外候補として提案します。Gitで追跡中の内容に一致する候補は適用せず、手動最適化画面には根拠と確信度を表示します。
 
 macOSの優先言語が日本語の場合は日本語、それ以外は英語で表示します。問題の報告とサポートは[GitHub Issues](https://github.com/rioriost/Durepo/issues)を利用してください。
