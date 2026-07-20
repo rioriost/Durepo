@@ -10,6 +10,20 @@ public enum DurepoConstants {
     ]
 }
 
+public enum FileSystemEventPolicy {
+    public static func ignoresOperationalNoise(_ relativePath: String) -> Bool {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: true)
+        guard components.count >= 3 else { return false }
+        for index in 0...(components.count - 3) where components[index] == ".git" {
+            if components[index + 1] == "fsmonitor--daemon",
+               components[index + 2] == "cookies" {
+                return true
+            }
+        }
+        return false
+    }
+}
+
 public struct ExclusionRuleSet: Codable, Hashable, Sendable {
     public let rules: [String]
     private let parsedRules: [ParsedExclusionRule]

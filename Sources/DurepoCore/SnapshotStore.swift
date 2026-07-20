@@ -409,13 +409,74 @@ public actor SnapshotStore {
         defer { releaseStoreLock(lockDescriptor) }
 
         var issues: [IntegrityIssue] = []
-        let databaseMessages = try metadataStore.integrityMessages()
+        let databaseMessages = try metadataStore.integrityMessages(quick: !deep)
         for message in databaseMessages where message.lowercased() != "ok" {
             issues.append(IntegrityIssue(severity: .error, message: "SQLite: \(message)"))
         }
 
         let manifestURLs = try fileManager.contentsOfDirectory(at: manifestsURL, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }
+        let referencedHashes = deep
+            ? try deepIntegrityReferences(manifestURLs: manifestURLs, issues: &issues)
+            : try lightweightIntegrityReferences(manifestURLs: manifestURLs, issues: &issues)
+
+        let storedObjects = try storedObjectURLs()
+        let orphanCount = storedObjects.lazy.filter { !referencedHashes.contains($0.lastPathComponent) }.count
+        if orphanCount > 0 {
+            issues.append(IntegrityIssue(
+                severity: .warning,
+                message: "\(orphanCount) unreferenced objects can be reclaimed."
+            ))
+        }
+        let availableCapacity = try? storageURL.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        ).volumeAvailableCapacityForImportantUsage
+        return StoreIntegrityReport(
+            snapshotCount: manifestURLs.count,
+            referencedObjectCount: referencedHashes.count,
+            storedObjectCount: storedObjects.count,
+            orphanObjectCount: orphanCount,
+            availableCapacity: availableCapacity,
+            issues: issues
+        )
+    }
+
+    private func lightweightIntegrityReferences(
+        manifestURLs: [URL],
+        issues: inout [IntegrityIssue]
+    ) throws -> Set<String> {
+        let overview = try metadataStore.integrityOverview()
+        let storedManifestNames = Set(manifestURLs.map(\.lastPathComponent))
+        let indexedManifestNames = Set(overview.manifestFiles)
+        for file in indexedManifestNames.subtracting(storedManifestNames).sorted() {
+            issues.append(IntegrityIssue(severity: .error, message: "Missing manifest: \(file)"))
+        }
+        for file in storedManifestNames.subtracting(indexedManifestNames).sorted() {
+            issues.append(IntegrityIssue(severity: .warning, message: "Unindexed manifest: \(file)"))
+        }
+        if overview.missingContentHashCount > 0 {
+            issues.append(IntegrityIssue(
+                severity: .error,
+                message: "\(overview.missingContentHashCount) file entries have no object reference."
+            ))
+        }
+        for hash in overview.referencedHashes {
+            guard Self.isValidContentHash(hash) else {
+                issues.append(IntegrityIssue(severity: .error, message: "Invalid object reference: \(hash)"))
+                continue
+            }
+            guard fileManager.fileExists(atPath: objectURL(for: hash).path) else {
+                issues.append(IntegrityIssue(severity: .error, message: "Missing object: \(hash)"))
+                continue
+            }
+        }
+        return overview.referencedHashes.filter(Self.isValidContentHash)
+    }
+
+    private func deepIntegrityReferences(
+        manifestURLs: [URL],
+        issues: inout [IntegrityIssue]
+    ) throws -> Set<String> {
         var referencedHashes: Set<String> = []
         for url in manifestURLs {
             let manifest: SnapshotManifest
@@ -442,31 +503,12 @@ public actor SnapshotStore {
                     issues.append(IntegrityIssue(severity: .error, message: "Missing object: \(hash)"))
                     continue
                 }
-                if deep, try Self.hashFile(at: object) != hash {
+                if try Self.hashFile(at: object) != hash {
                     issues.append(IntegrityIssue(severity: .error, message: "Object hash mismatch: \(hash)"))
                 }
             }
         }
-
-        let storedObjects = try storedObjectURLs()
-        let orphanCount = storedObjects.lazy.filter { !referencedHashes.contains($0.lastPathComponent) }.count
-        if orphanCount > 0 {
-            issues.append(IntegrityIssue(
-                severity: .warning,
-                message: "\(orphanCount) unreferenced objects can be reclaimed."
-            ))
-        }
-        let availableCapacity = try? storageURL.resourceValues(
-            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
-        ).volumeAvailableCapacityForImportantUsage
-        return StoreIntegrityReport(
-            snapshotCount: manifestURLs.count,
-            referencedObjectCount: referencedHashes.count,
-            storedObjectCount: storedObjects.count,
-            orphanObjectCount: orphanCount,
-            availableCapacity: availableCapacity,
-            issues: issues
-        )
+        return referencedHashes
     }
 
     public func garbageCollect() throws -> GarbageCollectionResult {
@@ -657,20 +699,29 @@ public actor SnapshotStore {
         }
     }
 
-    private static func manifestPathIssues(_ entries: [SnapshotEntry]) -> [String] {
+    static func manifestPathIssues(_ entries: [SnapshotEntry]) -> [String] {
         var issues: [String] = []
         let paths = entries.map(\.relativePath)
         if Set(paths).count != paths.count { issues.append("duplicate path") }
-        let symbolicLinkPaths = entries.lazy.filter { $0.kind == .symbolicLink }.map(\.relativePath)
+        let symbolicLinkPaths = Set(entries.lazy.filter { $0.kind == .symbolicLink }.map(\.relativePath))
         for path in paths {
             if path.isEmpty || path.contains("\0") || (try? validateRelativeChangePath(path)) != path {
                 issues.append(path)
             }
-            if symbolicLinkPaths.contains(where: { path.hasPrefix($0 + "/") }) {
+            if hasAncestor(in: symbolicLinkPaths, path: path) {
                 issues.append("entry below symbolic link: \(path)")
             }
         }
         return issues
+    }
+
+    private static func hasAncestor(in candidates: Set<String>, path: String) -> Bool {
+        var searchStart = path.startIndex
+        while let separator = path[searchStart...].firstIndex(of: "/") {
+            if candidates.contains(String(path[..<separator])) { return true }
+            searchStart = path.index(after: separator)
+        }
+        return false
     }
 
     private func acquireExclusiveStoreLock() throws -> Int32 {

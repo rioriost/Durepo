@@ -42,6 +42,20 @@ struct SnapshotStoreTests {
         #expect(!rules.excludes(".git/config"))
     }
 
+    @Test("Filesystem event policy ignores only Git fsmonitor cookie noise")
+    func filesystemEventPolicyIgnoresOnlyGitFsmonitorCookieNoise() {
+        #expect(FileSystemEventPolicy.ignoresOperationalNoise(
+            ".git/fsmonitor--daemon/cookies/5490-153313"
+        ))
+        #expect(FileSystemEventPolicy.ignoresOperationalNoise(
+            "Dependency/.git/fsmonitor--daemon/cookies/1"
+        ))
+        #expect(!FileSystemEventPolicy.ignoresOperationalNoise(".git/HEAD"))
+        #expect(!FileSystemEventPolicy.ignoresOperationalNoise(".git/index"))
+        #expect(!FileSystemEventPolicy.ignoresOperationalNoise(".git/refs/heads/main"))
+        #expect(!FileSystemEventPolicy.ignoresOperationalNoise("fsmonitor--daemon/cookies/1"))
+    }
+
     @Test("Negated rules cannot reinclude a file below an excluded parent")
     func excludedParentCannotBeReincluded() {
         let blocked = ExclusionRuleSet(["output/", "!output/keep.txt"])
@@ -966,6 +980,59 @@ struct SnapshotStoreTests {
             #expect(report.issues.contains { $0.message.contains("hash mismatch") })
             await #expect(throws: DurepoError.self) { try await store.verify(manifest) }
         }
+    }
+
+    @Test("Lightweight integrity checks use indexed metadata and leave content hashing to deep checks")
+    func lightweightIntegrityUsesMetadata() async throws {
+        try await withFixture { fixture in
+            try fixture.write("trusted", to: "file.txt")
+            let store = SnapshotStore(storageURL: fixture.storage)
+            let manifest = try await store.createSnapshot(
+                repositoryURL: fixture.repository,
+                repositoryID: UUID(),
+                reason: .smokeTest
+            )
+            let hash = try #require(manifest.entries.first { $0.kind == .file }?.contentHash)
+            try Data("tampered".utf8).write(to: await store.objectURL(for: hash))
+
+            let lightweight = try await store.checkIntegrity(deep: false)
+            #expect(lightweight.isHealthy)
+            #expect(lightweight.referencedObjectCount == 1)
+
+            let deep = try await store.checkIntegrity(deep: true)
+            #expect(!deep.isHealthy)
+            #expect(deep.issues.contains { $0.message.contains("hash mismatch") })
+        }
+    }
+
+    @Test("Manifest path validation scales with path depth instead of symbolic-link count")
+    func manifestPathValidationScales() {
+        let symbolicLinks = (0..<10_000).map {
+            SnapshotEntry(
+                relativePath: "links/\($0)",
+                kind: .symbolicLink,
+                posixMode: 0o120755,
+                symbolicLinkDestination: "../target"
+            )
+        }
+        let files = (0..<10_000).map {
+            SnapshotEntry(
+                relativePath: "files/\($0).txt",
+                kind: .file,
+                contentHash: String(repeating: "a", count: 64),
+                posixMode: 0o100644
+            )
+        }
+        let unsafeDescendant = SnapshotEntry(
+            relativePath: "links/9999/child.txt",
+            kind: .file,
+            contentHash: String(repeating: "b", count: 64),
+            posixMode: 0o100644
+        )
+
+        let issues = SnapshotStore.manifestPathIssues(symbolicLinks + files + [unsafeDescendant])
+
+        #expect(issues == ["entry below symbolic link: links/9999/child.txt"])
     }
 
     @Test("In-place restore refuses a repository with an active Git lock")

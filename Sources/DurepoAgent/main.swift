@@ -35,8 +35,11 @@ private actor AgentCoordinator {
     private var debounceTasks: [UUID: Task<Void, Never>] = [:]
     private var burstStartedAt: [UUID: ContinuousClock.Instant] = [:]
     private var snapshotting: Set<UUID> = []
-    private var lastLightweightIntegrityCheck = Date()
-    private var lastDeepIntegrityCheck = Date()
+    private var lastScheduledIntegrityCheck = Date()
+    private var lastIntegrityDeferralLog = Date.distantPast
+
+    private static let scheduledIntegrityInterval: TimeInterval = 6 * 3_600
+    private static let integrityDeferralLogInterval: TimeInterval = 15 * 60
 
     init(storageURL: URL) {
         registry = RepositoryRegistry(storageURL: storageURL)
@@ -48,19 +51,32 @@ private actor AgentCoordinator {
         let records = try await registry.records().filter(\.isEnabled)
         let globalRules = try exclusionRuleStore.rules()
         await updateSessions(records, globalRules: globalRules)
-        await runScheduledIntegrityCheckIfNeeded()
+        await runScheduledIntegrityCheckIfNeeded(records: records)
     }
 
-    private func runScheduledIntegrityCheckIfNeeded() async {
+    private func runScheduledIntegrityCheckIfNeeded(records: [RepositoryRecord]) async {
         let now = Date()
-        let deep = now.timeIntervalSince(lastDeepIntegrityCheck) >= 86_400
-        guard deep || now.timeIntervalSince(lastLightweightIntegrityCheck) >= 3_600 else { return }
-        lastLightweightIntegrityCheck = now
-        if deep { lastDeepIntegrityCheck = now }
+        guard now.timeIntervalSince(lastScheduledIntegrityCheck) >= Self.scheduledIntegrityInterval else { return }
+
+        guard snapshotting.isEmpty, debounceTasks.isEmpty else {
+            logIntegrityDeferralIfNeeded(now: now, reason: "snapshot work is active")
+            return
+        }
         do {
-            let report = try await store.checkIntegrity(deep: deep)
+            for record in records {
+                if let state = try await store.monitorState(repositoryID: record.id),
+                   state.hasPendingEvents || state.needsFullScan {
+                    logIntegrityDeferralIfNeeded(now: now, reason: "filesystem events are pending")
+                    return
+                }
+            }
+
+            lastScheduledIntegrityCheck = now
+            let startedAt = ContinuousClock.now
+            let report = try await store.checkIntegrity(deep: false)
+            let elapsed = startedAt.duration(to: .now)
             if report.isHealthy {
-                logger.info("Scheduled storage integrity check completed")
+                logger.info("Scheduled lightweight integrity check completed in \(elapsed.durepoMilliseconds, privacy: .public) ms")
             } else {
                 let message = report.issues.first(where: { $0.severity == .error })?.message
                     ?? "Durepo storage integrity check failed."
@@ -78,6 +94,12 @@ private actor AgentCoordinator {
         } catch {
             logger.error("Scheduled integrity check could not complete: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    private func logIntegrityDeferralIfNeeded(now: Date, reason: String) {
+        guard now.timeIntervalSince(lastIntegrityDeferralLog) >= Self.integrityDeferralLogInterval else { return }
+        lastIntegrityDeferralLog = now
+        logger.info("Scheduled integrity check deferred because \(reason, privacy: .public)")
     }
 
     private func updateSessions(_ records: [RepositoryRecord], globalRules: [String]) async {
@@ -341,6 +363,13 @@ private actor AgentCoordinator {
     }
 }
 
+private extension Duration {
+    var durepoMilliseconds: Int64 {
+        let value = components
+        return value.seconds * 1_000 + Int64(value.attoseconds / 1_000_000_000_000_000)
+    }
+}
+
 private final class RepositorySession: @unchecked Sendable {
     let record: RepositoryRecord
     let url: URL
@@ -485,7 +514,9 @@ private final class FSEventWatcher: @unchecked Sendable {
         guard path.hasPrefix(rootPath + "/") else { return nil }
         let relative = path.dropFirst(rootPath.count + 1)
         guard !relative.isEmpty else { return "" }
-        return exclusionRules.excludes(String(relative)) ? nil : String(relative)
+        let relativePath = String(relative)
+        guard !FileSystemEventPolicy.ignoresOperationalNoise(relativePath) else { return nil }
+        return exclusionRules.excludes(relativePath) ? nil : relativePath
     }
 
     deinit {

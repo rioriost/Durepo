@@ -35,3 +35,29 @@ existing snapshot, restore, retention, anomaly, and integrity tests.
 
 The rule knowledge is informed by GitHub's CC0-licensed `github/gitignore` templates;
 see `THIRD_PARTY_NOTICES.md`.
+
+## Build 4 snapshot scheduling fix
+
+An installed build was observed consuming about 90% CPU and delaying pending snapshots.
+The cause was the scheduled integrity check: it decoded every manifest and repeatedly
+scanned all symbolic-link paths while holding the snapshot store actor. On a real store
+with 102 manifests and about 1.4 million indexed entries, this could monopolize the agent
+long enough for FSEvents batches to accumulate.
+
+Build 4 changes scheduled integrity checks as follows:
+
+- Scheduled checks use SQLite `quick_check` and indexed manifest/object references instead
+  of decoding every manifest.
+- The scheduled check is deferred while a snapshot, debounce, full scan, or pending event
+  batch exists, so repository protection has priority over maintenance.
+- The interval is six hours and the agent no longer starts an automatic deep check.
+- A deep check remains available explicitly from Settings.
+- Symbolic-link ancestry validation now uses set membership by path component instead of
+  comparing every path with every symbolic link.
+- Git fsmonitor cookie events are ignored without excluding recoverable Git metadata such
+  as `HEAD`, the index, refs, or other `.git` content.
+
+On the affected real metadata database, SQLite `quick_check` completed in 0.36 seconds and
+the distinct object-reference query completed in 0.43 seconds. The path-validation stress
+test with 10,000 symbolic links and 10,000 files completed in 0.22 seconds. The complete
+Swift suite and the warning-as-error Release build both passed.

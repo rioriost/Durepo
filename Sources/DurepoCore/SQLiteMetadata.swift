@@ -1,6 +1,12 @@
 import Foundation
 import SQLite3
 
+struct MetadataIntegrityOverview {
+    let manifestFiles: [String]
+    let referencedHashes: Set<String>
+    let missingContentHashCount: Int
+}
+
 final class SQLiteMetadata {
     private var database: OpaquePointer?
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -792,12 +798,41 @@ final class SQLiteMetadata {
         }
     }
 
-    func integrityMessages() throws -> [String] {
-        try withStatement("PRAGMA integrity_check") { statement in
+    func integrityMessages(quick: Bool = false) throws -> [String] {
+        let pragma = quick ? "PRAGMA quick_check" : "PRAGMA integrity_check"
+        return try withStatement(pragma) { statement in
             var messages: [String] = []
             while sqlite3_step(statement) == SQLITE_ROW { messages.append(text(statement, 0)) }
             return messages
         }
+    }
+
+    func integrityOverview() throws -> MetadataIntegrityOverview {
+        let manifestFiles = try withStatement("SELECT manifest_file FROM snapshots") { statement in
+            var result: [String] = []
+            while sqlite3_step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
+            return result
+        }
+        let referencedHashes = try withStatement("""
+            SELECT DISTINCT content_hash FROM snapshot_entries
+            WHERE kind = 'file' AND content_hash IS NOT NULL
+            """) { statement in
+            var result: Set<String> = []
+            while sqlite3_step(statement) == SQLITE_ROW { result.insert(text(statement, 0)) }
+            return result
+        }
+        let missingContentHashCount = try withStatement("""
+            SELECT COUNT(*) FROM snapshot_entries
+            WHERE kind = 'file' AND content_hash IS NULL
+            """) { statement in
+            guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+            return Int(sqlite3_column_int64(statement, 0))
+        }
+        return MetadataIntegrityOverview(
+            manifestFiles: manifestFiles,
+            referencedHashes: referencedHashes,
+            missingContentHashCount: missingContentHashCount
+        )
     }
 
     func pruneOldestCapacityCandidate() throws -> String? {
