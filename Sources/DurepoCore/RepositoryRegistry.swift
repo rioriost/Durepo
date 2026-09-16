@@ -1,5 +1,13 @@
 import Foundation
 
+public enum RepositoryRegistryError: LocalizedError, Sendable {
+    case accessChanged
+
+    public var errorDescription: String? {
+        String(localized: "Repository access changed during background setup. Please retry.")
+    }
+}
+
 public actor RepositoryRegistry {
     private let registryURL: URL
     private let fileManager: FileManager
@@ -19,27 +27,110 @@ public actor RepositoryRegistry {
     }
 
     public func add(_ record: RepositoryRecord) throws {
-        var current = try records()
-        current.removeAll { $0.id == record.id }
-        current.append(record)
-        try save(current)
+        try mutate { current in
+            guard !current.contains(where: { $0.id == record.id }) else {
+                throw CocoaError(.fileWriteFileExists)
+            }
+            current.append(record)
+        }
     }
 
-    public func remove(id: UUID) throws {
-        var current = try records()
-        current.removeAll { $0.id == id }
-        try save(current)
+    @discardableResult
+    public func remove(id: UUID) throws -> RepositoryRecord? {
+        try mutate { current in
+            guard let index = current.firstIndex(where: { $0.id == id }) else { return nil }
+            return current.remove(at: index)
+        }
     }
 
     public func update(_ record: RepositoryRecord) throws {
-        var current = try records()
-        guard let index = current.firstIndex(where: { $0.id == record.id }) else {
-            current.append(record)
-            try save(current)
-            return
+        try mutateRecord(id: record.id) { current in
+            let agentBookmark = current.agentBookmark
+            current = record
+            if current.agentBookmark == nil {
+                current.agentBookmark = agentBookmark
+            }
+            if current.agentBookmark != nil {
+                current.handoffBookmark = nil
+            }
         }
-        current[index] = record
+    }
+
+    @discardableResult
+    public func updateExclusionRules(id: UUID, rules: [String]?) throws -> RepositoryRecord {
+        try mutateRecord(id: id) { $0.customExclusionRules = rules.map { ExclusionRuleSet($0).rules } }
+    }
+
+    @discardableResult
+    public func updateAgentBookmark(
+        id: UUID,
+        bookmark: Data,
+        matchingAppBookmark: Data? = nil
+    ) throws -> RepositoryRecord {
+        try mutateRecord(id: id) {
+            if let matchingAppBookmark, $0.bookmark != matchingAppBookmark {
+                throw RepositoryRegistryError.accessChanged
+            }
+            $0.agentBookmark = bookmark
+            $0.handoffBookmark = nil
+        }
+    }
+
+    @discardableResult
+    public func replaceRepositoryAccess(
+        id: UUID,
+        bookmark: Data,
+        handoffBookmark: Data,
+        isEnabled: Bool? = nil
+    ) throws -> RepositoryRecord {
+        try mutateRecord(id: id) {
+            $0.bookmark = bookmark
+            $0.handoffBookmark = handoffBookmark
+            $0.agentBookmark = nil
+            if let isEnabled { $0.isEnabled = isEnabled }
+        }
+    }
+
+    @discardableResult
+    public func setEnabled(id: UUID, isEnabled: Bool) throws -> RepositoryRecord {
+        try mutateRecord(id: id) { $0.isEnabled = isEnabled }
+    }
+
+    @discardableResult
+    public func updateHandoffBookmark(id: UUID, bookmark: Data) throws -> RepositoryRecord {
+        try mutateRecord(id: id) {
+            if $0.agentBookmark == nil { $0.handoffBookmark = bookmark }
+        }
+    }
+
+    @discardableResult
+    public func updateAppBookmark(id: UUID, bookmark: Data) throws -> RepositoryRecord {
+        try mutateRecord(id: id) { $0.bookmark = bookmark }
+    }
+
+    @discardableResult
+    private func mutateRecord(
+        id: UUID,
+        _ mutation: (inout RepositoryRecord) throws -> Void
+    ) throws -> RepositoryRecord {
+        try mutate { records in
+            guard let index = records.firstIndex(where: { $0.id == id }) else {
+                throw DurepoError.repositoryNotRegistered
+            }
+            try mutation(&records[index])
+            return records[index]
+        }
+    }
+
+    private func mutate<Result>(_ mutation: (inout [RepositoryRecord]) throws -> Result) throws -> Result {
+        let directory = registryURL.deletingLastPathComponent()
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let lock = try FileOperationLock.acquireSync(at: directory.appending(path: ".registry.lock"))
+        defer { lock.release() }
+        var current = try records()
+        let result = try mutation(&current)
         try save(current)
+        return result
     }
 
     private func save(_ records: [RepositoryRecord]) throws {

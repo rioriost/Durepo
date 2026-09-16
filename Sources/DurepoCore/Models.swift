@@ -292,6 +292,7 @@ public enum SnapshotHealthState: String, Codable, Sendable {
 }
 
 public enum RepositoryAnomalyKind: String, Codable, Sendable {
+    case snapshotRecovery
     case gitDirectoryDeleted
     case repositoryUnavailable
     case massDeletion
@@ -526,10 +527,12 @@ public struct SnapshotDiffPage: Sendable {
 public struct InPlaceRestoreResult: Sendable {
     public let restoredURL: URL
     public let preRestoreSnapshot: SnapshotManifest
+    public let rollbackURL: URL
 
-    public init(restoredURL: URL, preRestoreSnapshot: SnapshotManifest) {
+    public init(restoredURL: URL, preRestoreSnapshot: SnapshotManifest, rollbackURL: URL) {
         self.restoredURL = restoredURL
         self.preRestoreSnapshot = preRestoreSnapshot
+        self.rollbackURL = rollbackURL
     }
 }
 

@@ -485,13 +485,30 @@ public actor RepositoryExclusionOptimizer {
     }
 
     private func readTrackedPaths(repositoryURL: URL) -> TrackedPaths {
-        guard fileManager.fileExists(atPath: repositoryURL.appending(path: ".git").path) else {
-            return .notGitRepository
+        var ancestor = repositoryURL.resolvingSymlinksInPath().standardizedFileURL
+        var foundGitMarker = false
+        while true {
+            let marker = ancestor.appending(path: ".git")
+            do {
+                _ = try marker.lstatInfo()
+                foundGitMarker = true
+                break
+            } catch let error as POSIXError where error.code == .ENOENT || error.code == .ENOTDIR {
+                if ancestor.path == "/" { break }
+                let parent = ancestor.deletingLastPathComponent().standardizedFileURL
+                if parent.path == ancestor.path { break }
+                ancestor = parent
+            } catch {
+                return .unavailable
+            }
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["-C", repositoryURL.path, "-c", "core.quotepath=false", "ls-files", "-z"]
+        process.arguments = ["-C", repositoryURL.path, "-c", "core.quotepath=false", "ls-files", "-z", "--", "."]
         var environment = ProcessInfo.processInfo.environment
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_PREFIX"] {
+            environment.removeValue(forKey: key)
+        }
         environment["GIT_OPTIONAL_LOCKS"] = "0"
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         process.environment = environment
@@ -502,7 +519,9 @@ public actor RepositoryExclusionOptimizer {
             try process.run()
             let data = output.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return .unavailable }
+            guard process.terminationStatus == 0 else {
+                return foundGitMarker ? .unavailable : .notGitRepository
+            }
             let paths = data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
             return .available(Set(paths))
         } catch {

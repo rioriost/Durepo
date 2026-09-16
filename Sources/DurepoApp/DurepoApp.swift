@@ -11,7 +11,17 @@ struct DurepoApp: App {
                 .frame(minWidth: 860, minHeight: 560)
                 .task { await model.run() }
                 .alert(item: $model.alert) { alert in
-                    Alert(
+                    if let recoveryURL = alert.recoveryURL {
+                        return Alert(
+                            title: Text(alert.title),
+                            message: Text(alert.message),
+                            primaryButton: .default(Text("Show Previous Folder")) {
+                                NSWorkspace.shared.activateFileViewerSelecting([recoveryURL])
+                            },
+                            secondaryButton: .cancel(Text("OK"))
+                        )
+                    }
+                    return Alert(
                         title: Text(alert.title),
                         message: Text(alert.message),
                         dismissButton: .default(Text("OK"))

@@ -1,4 +1,5 @@
 import DurepoCore
+import ServiceManagement
 import SwiftUI
 
 struct ContentView: View {
@@ -74,6 +75,7 @@ private struct DashboardView: View {
                             Button("Acknowledge") {
                                 Task { await model.acknowledge(alert) }
                             }
+                            .disabled(model.isBusy)
                         }
                         .padding(6)
                     }
@@ -141,6 +143,7 @@ private struct RepositoriesView: View {
                 } actions: {
                     Button("Add Repository") { Task { await model.addRepository() } }
                         .buttonStyle(.borderedProminent)
+                        .disabled(model.isBusy)
                 }
             } else {
                 List(selection: $model.selectedRepositoryID) {
@@ -150,11 +153,31 @@ private struct RepositoriesView: View {
                                 .foregroundStyle(.tint)
                             VStack(alignment: .leading) {
                                 Text(repository.displayName).font(.headline)
+                                Text(repository.customExclusionRules == nil
+                                     ? String(localized: "Uses Default Rules")
+                                     : String(localized: "Independent Exclusion Rules"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if let message = model.repositoryAccessErrors[repository.id] {
+                                    Label(message, systemImage: "exclamationmark.triangle")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                } else if !repository.isEnabled {
+                                    Text("Background protection is paused. Reconnect the repository folder.")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                }
                                 Text(repository.addedAt, format: .dateTime.year().month().day().hour().minute())
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
+                            if model.repositoryAccessErrors[repository.id] != nil || !repository.isEnabled {
+                                Button("Reconnect Folder…") {
+                                    Task { await model.reconnectRepository(repository) }
+                                }
+                                .disabled(model.isBusy)
+                            }
                             Button("Edit Exclusion Rules") {
                                 repositoryEditingExclusions = repository
                             }
@@ -162,7 +185,7 @@ private struct RepositoriesView: View {
                             Button("Snapshot Now") {
                                 Task { await model.createSnapshot(of: repository) }
                             }
-                            .disabled(model.isBusy)
+                            .disabled(model.isBusy || !repository.isEnabled)
                             Button(role: .destructive) {
                                 repositoryPendingDeletion = repository
                             } label: {
@@ -170,6 +193,7 @@ private struct RepositoriesView: View {
                             }
                             .help("Remove Repository…")
                             .buttonStyle(.borderless)
+                            .disabled(model.isBusy)
                         }
                         .padding(.vertical, 5)
                         .tag(repository.id)
@@ -181,6 +205,7 @@ private struct RepositoriesView: View {
         .sheet(item: $repositoryPendingDeletion) { repository in
             RepositoryDeletionDialog(
                 repository: repository,
+                isBusy: model.isBusy,
                 cancel: { repositoryPendingDeletion = nil },
                 deleteSnapshots: {
                     repositoryPendingDeletion = nil
@@ -196,6 +221,7 @@ private struct RepositoriesView: View {
             RepositoryExclusionRulesDialog(
                 repository: repository,
                 initialRules: model.exclusionRules(for: repository),
+                isBusy: model.isBusy,
                 cancel: { repositoryEditingExclusions = nil },
                 optimize: { rules in
                     await model.optimizedExclusionRules(for: repository, existingRules: rules)
@@ -212,9 +238,10 @@ private struct RepositoriesView: View {
 
 private struct RepositoryExclusionRulesDialog: View {
     let repository: RepositoryRecord
+    let isBusy: Bool
     let cancel: () -> Void
     let optimize: ([String]) async -> RepositoryExclusionOptimizationResult?
-    let save: ([String]) async -> Void
+    let save: ([String]?) async -> Void
 
     @State private var rules: [String]
     @State private var isOptimizing = false
@@ -224,11 +251,13 @@ private struct RepositoryExclusionRulesDialog: View {
     init(
         repository: RepositoryRecord,
         initialRules: [String],
+        isBusy: Bool,
         cancel: @escaping () -> Void,
         optimize: @escaping ([String]) async -> RepositoryExclusionOptimizationResult?,
-        save: @escaping ([String]) async -> Void
+        save: @escaping ([String]?) async -> Void
     ) {
         self.repository = repository
+        self.isBusy = isBusy
         self.cancel = cancel
         self.optimize = optimize
         self.save = save
@@ -241,6 +270,13 @@ private struct RepositoryExclusionRulesDialog: View {
                 .font(.title2.bold())
             Text(repository.displayName)
                 .font(.headline)
+            Text(repository.customExclusionRules == nil
+                 ? String(localized: "Uses Default Rules")
+                 : String(localized: "Independent Exclusion Rules"))
+                .font(.subheadline)
+            Text("Saving creates independent rules. Use Default Rules to follow future default changes.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Text("Uses .gitignore syntax. Git metadata is always protected.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -260,6 +296,7 @@ private struct RepositoryExclusionRulesDialog: View {
                 }
             )
             .frame(minHeight: 230)
+            .disabled(isSaving || isOptimizing || isBusy)
 
             if let optimizationResult {
                 ExclusionOptimizationSummary(result: optimizationResult)
@@ -270,6 +307,14 @@ private struct RepositoryExclusionRulesDialog: View {
             HStack {
                 Button("Cancel", action: cancel)
                     .disabled(isSaving)
+                Button("Use Default Rules") {
+                    isSaving = true
+                    Task {
+                        await save(nil)
+                        isSaving = false
+                    }
+                }
+                .disabled(isSaving || isOptimizing || isBusy)
                 Spacer()
                 Button("Save") {
                     isSaving = true
@@ -279,7 +324,7 @@ private struct RepositoryExclusionRulesDialog: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isSaving || isOptimizing)
+                .disabled(isSaving || isOptimizing || isBusy)
             }
         }
         .padding(24)
@@ -421,6 +466,7 @@ private struct ExclusionRuleListEditor: View {
 
 private struct RepositoryDeletionDialog: View {
     let repository: RepositoryRecord
+    let isBusy: Bool
     let cancel: () -> Void
     let deleteSnapshots: () -> Void
     let permanentlyDeleteSnapshots: () -> Void
@@ -447,9 +493,11 @@ private struct RepositoryDeletionDialog: View {
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("Delete Snapshots", action: deleteSnapshots)
+                    .disabled(isBusy)
                 Button("Permanently Delete Snapshots", role: .destructive, action: permanentlyDeleteSnapshots)
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
+                    .disabled(isBusy)
             }
         }
         .padding(24)
@@ -524,6 +572,7 @@ private struct SnapshotTable: View {
                         Image(systemName: snapshot.isProtected ? "shield.slash" : "shield")
                     }
                     .help(snapshot.isProtected ? "Remove Protection" : "Protect Snapshot")
+                    .disabled(model.isBusy)
                     Button { snapshotShowingChanges = snapshot } label: {
                         Image(systemName: "list.bullet.rectangle")
                     }
@@ -537,7 +586,7 @@ private struct SnapshotTable: View {
                         Image(systemName: "arrow.counterclockwise")
                     }
                     .help("Restore…")
-                        .disabled(model.isBusy || !model.repositories.contains { $0.id == snapshot.repositoryID })
+                        .disabled(model.isBusy)
                 }
             }
             .width(125)
@@ -556,6 +605,7 @@ private struct SnapshotTable: View {
         .sheet(item: $snapshotRestoringInPlace) { snapshot in
             InPlaceRestoreDialog(
                 snapshot: snapshot,
+                isBusy: model.isBusy,
                 cancel: { snapshotRestoringInPlace = nil },
                 restore: {
                     snapshotRestoringInPlace = nil
@@ -568,6 +618,7 @@ private struct SnapshotTable: View {
 
 private struct InPlaceRestoreDialog: View {
     let snapshot: SnapshotSummary
+    let isBusy: Bool
     let cancel: () -> Void
     let restore: () -> Void
 
@@ -582,7 +633,7 @@ private struct InPlaceRestoreDialog: View {
                         .font(.title2.bold())
                     Text(snapshot.repositoryName)
                         .font(.headline)
-                    Text("Durepo first creates a complete pre-restore snapshot, verifies the selected snapshot, and then replaces the repository. If replacement fails, the original directory is put back.")
+                    Text("Durepo protects a pre-restore snapshot of included files and preserves currently excluded files. The restored and current folders are exchanged atomically. The previous folder is kept separately for recovery.")
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -594,6 +645,7 @@ private struct InPlaceRestoreDialog: View {
                 Button("Restore in Place", role: .destructive, action: restore)
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
+                    .disabled(isBusy)
             }
         }
         .padding(24)
@@ -616,9 +668,11 @@ private struct SnapshotChangesDialog: View {
 
     @State private var entries: [SnapshotDiffEntry] = []
     @State private var selection: Set<String> = []
-    @State private var isLoading = false
+    @State private var pageLoadState = SnapshotPageLoadState()
     @State private var hasMore = true
     @State private var listingMode = ListingMode.changes
+    @State private var loadingError: String?
+    private var isLoading: Bool { pageLoadState.isLoading }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -660,7 +714,13 @@ private struct SnapshotChangesDialog: View {
                 }
             }
             .overlay {
-                if entries.isEmpty, !isLoading, !hasMore {
+                if entries.isEmpty, let loadingError {
+                    ContentUnavailableView(
+                        "Unable to Load Snapshot",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(loadingError)
+                    )
+                } else if entries.isEmpty, !isLoading, !hasMore {
                     ContentUnavailableView("No changes", systemImage: "equal.circle")
                 }
             }
@@ -668,7 +728,9 @@ private struct SnapshotChangesDialog: View {
             if hasMore {
                 HStack {
                     Spacer()
-                    Button("Load More") { Task { await loadNextPage() } }
+                    Button(loadingError == nil ? String(localized: "Load More") : String(localized: "Retry")) {
+                        Task { await loadNextPage() }
+                    }
                         .disabled(isLoading)
                     if isLoading { ProgressView().controlSize(.small) }
                     Spacer()
@@ -689,7 +751,7 @@ private struct SnapshotChangesDialog: View {
                     .foregroundStyle(.secondary)
                 Button("Restore Selected") { restore(selection) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(selection.isEmpty || isLoading)
+                    .disabled(selection.isEmpty || isLoading || model.isBusy)
             }
         }
         .padding(24)
@@ -697,11 +759,14 @@ private struct SnapshotChangesDialog: View {
         .interactiveDismissDisabled()
         .task { await loadNextPage() }
         .onChange(of: listingMode) {
+            pageLoadState.reset()
             entries = []
             selection = []
             hasMore = true
+            loadingError = nil
             Task { await loadNextPage() }
         }
+        .onDisappear { pageLoadState.reset() }
     }
 
     private func selectionBinding(for entry: SnapshotDiffEntry) -> Binding<Bool> {
@@ -715,18 +780,24 @@ private struct SnapshotChangesDialog: View {
     }
 
     private func loadNextPage() async {
-        guard hasMore, !isLoading else { return }
-        isLoading = true
-        defer { isLoading = false }
-        let page = listingMode == .changes
-            ? await model.snapshotDiff(snapshot, offset: entries.count)
-            : await model.snapshotEntries(snapshot, offset: entries.count)
-        guard let page else {
-            hasMore = false
-            return
+        guard hasMore, let request = pageLoadState.begin() else { return }
+        loadingError = nil
+        let requestedMode = listingMode
+        do {
+            let page: SnapshotDiffPage
+            if requestedMode == .changes {
+                page = try await model.snapshotDiff(snapshot, offset: entries.count)
+            } else {
+                page = try await model.snapshotEntries(snapshot, offset: entries.count)
+            }
+            guard pageLoadState.finish(request), listingMode == requestedMode else { return }
+            entries.append(contentsOf: page.entries)
+            hasMore = page.hasMore
+        } catch {
+            guard pageLoadState.finish(request), listingMode == requestedMode else { return }
+            loadingError = error.localizedDescription
+            model.present(error)
         }
-        entries.append(contentsOf: page.entries)
-        hasMore = page.hasMore
     }
 }
 
@@ -743,6 +814,16 @@ struct SettingsView: View {
                 )
             )
             .toggleStyle(.switch)
+            .disabled(model.isBusy)
+
+            if model.agentStatus == .requiresApproval {
+                Text("Allow Durepo in System Settings > General > Login Items.")
+                    .font(.caption)
+                Button("Login Item Settings") { SMAppService.openSystemSettingsLoginItems() }
+            } else if model.agentStatus == .notFound {
+                Text("The embedded background agent could not be found.")
+                    .foregroundStyle(.orange)
+            }
 
             Toggle(
                 "Launch at Login",
@@ -753,6 +834,7 @@ struct SettingsView: View {
             )
             .toggleStyle(.checkbox)
             .accessibilityLabel(Text("Launch at Login"))
+            .disabled(model.isBusy)
 
             Divider()
 
@@ -767,7 +849,7 @@ struct SettingsView: View {
 
             Text("Default Exclusion Rules")
                 .font(.headline)
-            Text("Uses .gitignore syntax. Repositories inherit these rules until repository-specific rules are saved.")
+            Text("Uses .gitignore syntax. Repositories use these defaults unless independent rules are saved or automatically suggested. Use Default Rules in the repository editor to resume inheritance.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             ExclusionRuleListEditor(
@@ -778,6 +860,7 @@ struct SettingsView: View {
             )
             .frame(height: 180)
             .padding(.bottom, 16)
+            .disabled(model.isBusy)
 
             Divider()
 

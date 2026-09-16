@@ -35,6 +35,8 @@ private actor AgentCoordinator {
     private var debounceTasks: [UUID: Task<Void, Never>] = [:]
     private var burstStartedAt: [UUID: ContinuousClock.Instant] = [:]
     private var snapshotting: Set<UUID> = []
+    private var rebuilding: Set<UUID> = []
+    private var reportedErrors: [UUID: String] = [:]
     private var lastScheduledIntegrityCheck = Date()
     private var lastIntegrityDeferralLog = Date.distantPast
 
@@ -108,63 +110,110 @@ private actor AgentCoordinator {
             sessions.removeValue(forKey: id)
             debounceTasks.removeValue(forKey: id)?.cancel()
             burstStartedAt.removeValue(forKey: id)
+            reportedErrors.removeValue(forKey: id)
         }
 
         for record in records {
             let exclusionRules = record.effectiveExclusionRules(globalRules: globalRules)
             let rulesChanged = sessions[record.id].map { $0.exclusionRules != exclusionRules } ?? false
-            guard sessions[record.id] == nil || rulesChanged else { continue }
-            if rulesChanged {
-                sessions.removeValue(forKey: record.id)
-                debounceTasks.removeValue(forKey: record.id)?.cancel()
-                burstStartedAt.removeValue(forKey: record.id)
-            }
+            let accessChanged = sessions[record.id].map {
+                $0.record.bookmark != record.bookmark || $0.record.agentBookmark != record.agentBookmark
+            } ?? false
+            if rulesChanged || accessChanged { sessions[record.id]?.needsRebuild = true }
+            guard sessions[record.id] == nil || sessions[record.id]?.needsRebuild == true else { continue }
+            guard !snapshotting.contains(record.id), !rebuilding.contains(record.id) else { continue }
+            rebuilding.insert(record.id)
+            let rootChanged = sessions[record.id]?.needsRebuild == true
+            sessions.removeValue(forKey: record.id)
+            debounceTasks.removeValue(forKey: record.id)?.cancel()
+            burstStartedAt.removeValue(forKey: record.id)
             do {
-                let (agentRecord, url) = try await resolveRepository(record)
-                let identity = try repositoryIdentity(at: url)
-                let state = try await store.prepareMonitor(
-                    repositoryID: record.id,
-                    volumeID: identity.volumeID,
-                    rootID: identity.rootID
-                )
-                let sinceWhen = state.lastCommittedEventID == 0
-                    ? FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
-                    : FSEventStreamEventId(state.lastCommittedEventID)
-                let watcher = try FSEventWatcher(
-                    url: url,
-                    sinceWhen: sinceWhen,
-                    exclusionRules: exclusionRules
-                ) { [weak self] batch in
-                    guard let self else { return }
-                    Task { await self.record(batch, for: record.id) }
-                }
-                sessions[record.id] = RepositorySession(
-                    record: agentRecord,
-                    url: url,
-                    exclusionRules: exclusionRules,
-                    suppressNextAnomaly: rulesChanged,
-                    watcher: watcher
-                )
-                logger.info("Monitoring \(agentRecord.displayName, privacy: .private)")
-                if rulesChanged { try await store.requireFullScan(repositoryID: record.id) }
-                if state.hasPendingEvents || state.needsFullScan || rulesChanged {
-                    Task { [weak self] in await self?.createSnapshot(for: record.id) }
-                }
+                try await startSession(record, exclusionRules: exclusionRules, rulesChanged: rulesChanged, rootChanged: rootChanged)
+            } catch DurepoError.repositoryNotRegistered {
+                logger.info("Repository was removed while monitoring was starting")
+            } catch RepositoryRegistryError.accessChanged {
+                logger.info("Repository access changed; monitoring setup will retry")
             } catch {
                 logger.error("Unable to monitor \(record.displayName, privacy: .private): \(error.localizedDescription, privacy: .public)")
+                await report(error, repositoryID: record.id)
             }
+            rebuilding.remove(record.id)
+        }
+    }
+
+    private func startSession(
+        _ record: RepositoryRecord,
+        exclusionRules: ExclusionRuleSet,
+        rulesChanged: Bool,
+        rootChanged: Bool
+    ) async throws {
+        let (agentRecord, url) = try await resolveRepository(record)
+        var accessTransferred = false
+        defer { if !accessTransferred { url.stopAccessingSecurityScopedResource() } }
+        let identity = try repositoryIdentity(at: url)
+        let state = try await store.prepareMonitor(
+            repositoryID: record.id,
+            volumeID: identity.volumeID,
+            rootID: identity.rootID
+        )
+        let needsScan = MonitorRecoveryPolicy.requiresStartupScan(
+            lastCommittedEventID: state.lastCommittedEventID,
+            hasPendingEvents: state.hasPendingEvents,
+            needsFullScan: state.needsFullScan,
+            sessionChanged: rulesChanged || rootChanged
+        )
+        if state.lastCommittedEventID == 0 || rulesChanged || rootChanged {
+            try await store.requireFullScan(repositoryID: record.id)
+        }
+        let sinceWhen = state.lastCommittedEventID == 0
+            ? FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+            : FSEventStreamEventId(state.lastCommittedEventID)
+        let generation = UUID()
+        let watcher = try FSEventWatcher(
+            url: url,
+            sinceWhen: sinceWhen,
+            exclusionRules: exclusionRules
+        ) { [weak self] batch in
+            guard let self else { return }
+            Task { await self.record(batch, for: record.id, generation: generation) }
+        }
+        sessions[record.id] = RepositorySession(
+            record: agentRecord,
+            url: url,
+            exclusionRules: exclusionRules,
+            suppressNextAnomaly: rulesChanged,
+            watcher: watcher,
+            generation: generation
+        )
+        accessTransferred = true
+        logger.info("Monitoring \(agentRecord.displayName, privacy: .private)")
+        if needsScan {
+            scheduleSnapshot(for: record.id)
+        } else {
+            try await store.clearAgentError(repositoryID: record.id)
+            reportedErrors.removeValue(forKey: record.id)
         }
     }
 
     private func repositoryIdentity(at url: URL) throws -> (volumeID: String, rootID: String) {
         let values = try url.resourceValues(forKeys: [.volumeUUIDStringKey, .fileResourceIdentifierKey])
+        guard let volumeID = values.volumeUUIDString, let rootID = values.fileResourceIdentifier else {
+            throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: url.path])
+        }
         return (
-            values.volumeUUIDString ?? "unknown-volume",
-            values.fileResourceIdentifier.map { String(describing: $0) } ?? url.standardizedFileURL.path
+            volumeID,
+            "\(String(describing: rootID)):\(url.standardizedFileURL.path)"
         )
     }
 
-    private func record(_ batch: FSEventBatch, for repositoryID: UUID) async {
+    private func record(_ batch: FSEventBatch, for repositoryID: UUID, generation: UUID) async {
+        guard let session = sessions[repositoryID], session.generation == generation else { return }
+        let rootChanged = batch.flags & UInt64(kFSEventStreamEventFlagRootChanged) != 0
+        if rootChanged {
+            session.needsRebuild = true
+            debounceTasks.removeValue(forKey: repositoryID)?.cancel()
+            burstStartedAt.removeValue(forKey: repositoryID)
+        }
         do {
             try await store.recordEvent(
                 repositoryID: repositoryID,
@@ -173,7 +222,11 @@ private actor AgentCoordinator {
                 needsFullScan: batch.needsFullScan,
                 changedPaths: batch.changedPaths
             )
-            scheduleSnapshot(for: repositoryID)
+            if rootChanged {
+                try await refreshRegistrations()
+            } else if !session.needsRebuild {
+                scheduleSnapshot(for: repositoryID)
+            }
         } catch {
             await report(error, repositoryID: repositoryID)
         }
@@ -203,9 +256,9 @@ private actor AgentCoordinator {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
-            agentRecord.agentBookmark = persistentBookmark
-            agentRecord.handoffBookmark = nil
-            try await registry.update(agentRecord)
+            agentRecord = try await registry.updateAgentBookmark(
+                id: record.id, bookmark: persistentBookmark, matchingAppBookmark: record.bookmark
+            )
         }
 
         var persistentIsStale = false
@@ -217,6 +270,17 @@ private actor AgentCoordinator {
         )
         guard url.startAccessingSecurityScopedResource() else {
             throw DurepoError.bookmarkAccessDenied
+        }
+        if persistentIsStale {
+            do {
+                let refreshed = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+                agentRecord = try await registry.updateAgentBookmark(
+                    id: record.id, bookmark: refreshed, matchingAppBookmark: record.bookmark
+                )
+            } catch {
+                url.stopAccessingSecurityScopedResource()
+                throw error
+            }
         }
         return (agentRecord, url)
     }
@@ -256,7 +320,7 @@ private actor AgentCoordinator {
         snapshotting.insert(repositoryID)
         defer { snapshotting.remove(repositoryID) }
         while !Task.isCancelled {
-            guard let session = sessions[repositoryID] else { return }
+            guard let session = sessions[repositoryID], !session.needsRebuild else { return }
             do {
                 let state = try await store.monitorState(repositoryID: repositoryID)
                 let targetEventID = state?.lastSeenEventID ?? 0
@@ -265,6 +329,7 @@ private actor AgentCoordinator {
                     through: targetEventID
                 )
                 let suppressRestoredEvents = try await store.hasRestoreSuppression(repositoryID: repositoryID)
+                guard !session.needsRebuild else { return }
                 let manifest = try await store.createSnapshot(
                     repositoryURL: session.url,
                     repositoryID: session.record.id,
@@ -274,12 +339,21 @@ private actor AgentCoordinator {
                     detectAnomalies: !session.suppressNextAnomaly && !suppressRestoredEvents,
                     requiresRegisteredRepository: true
                 )
+                guard !session.needsRebuild else {
+                    try await store.requireFullScan(repositoryID: repositoryID)
+                    return
+                }
                 session.suppressNextAnomaly = false
                 if suppressRestoredEvents {
                     try await store.clearRestoreSuppression(repositoryID: repositoryID)
                 }
                 let committed = try await store.commitEvents(repositoryID: repositoryID, through: targetEventID)
+                if session.needsRebuild {
+                    try await store.requireFullScan(repositoryID: repositoryID)
+                    return
+                }
                 try await store.clearAgentError(repositoryID: repositoryID)
+                reportedErrors.removeValue(forKey: repositoryID)
                 if let alert = try await store.protectionAlerts().first(where: { $0.snapshotID == manifest.id }) {
                     await publishProtectionAlert(alert)
                 }
@@ -319,16 +393,24 @@ private actor AgentCoordinator {
     private func scheduleRetry(for repositoryID: UUID) {
         debounceTasks[repositoryID]?.cancel()
         debounceTasks[repositoryID] = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(30))
-            await self?.finishDebouncedSnapshot(for: repositoryID)
+            do {
+                try await Task.sleep(for: .seconds(30))
+                await self?.finishDebouncedSnapshot(for: repositoryID)
+            } catch is CancellationError {
+                return
+            } catch {
+                logger.error("Snapshot retry could not wait: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
     private func report(_ error: Error, repositoryID: UUID) async {
         let message = error.localizedDescription
         logger.error("Snapshot failed for \(repositoryID.uuidString, privacy: .public): \(message, privacy: .public)")
+        guard reportedErrors[repositoryID] != message else { return }
         do {
             let health = try await store.recordAgentError(repositoryID: repositoryID, message: message)
+            reportedErrors[repositoryID] = message
             let content = UNMutableNotificationContent()
             content.title = "Durepo"
             content.body = message
@@ -375,20 +457,24 @@ private final class RepositorySession: @unchecked Sendable {
     let url: URL
     let exclusionRules: ExclusionRuleSet
     var suppressNextAnomaly: Bool
+    var needsRebuild = false
     let watcher: FSEventWatcher
+    let generation: UUID
 
     init(
         record: RepositoryRecord,
         url: URL,
         exclusionRules: ExclusionRuleSet,
         suppressNextAnomaly: Bool,
-        watcher: FSEventWatcher
+        watcher: FSEventWatcher,
+        generation: UUID
     ) {
         self.record = record
         self.url = url
         self.exclusionRules = exclusionRules
         self.suppressNextAnomaly = suppressNextAnomaly
         self.watcher = watcher
+        self.generation = generation
     }
 
     deinit {

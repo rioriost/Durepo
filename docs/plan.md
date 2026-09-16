@@ -1,5 +1,13 @@
 # Durepo 実装プラン
 
+> 1.1.1 safety update (2026-09-16): [Astraレビュー](./astra-review-2026-09-16.md)の修正として、
+> 保存・起動時reconcile・GC・削除・復元の操作をプロセス間のfile-description lockで排他する。
+> 不完全な走査はcommitせず、未commit manifestの回復時は警告と保護を付ける。
+> 削除tombstoneと永続的なintegrity failureをSQLiteへ追加する。
+> 元位置復元は除外データを保持して原子的なdirectory exchangeを行い、元treeを
+> `.durepo-rollback-…` として残す。退避先は自動削除しない。
+> この更新は、後述の旧rollback削除・actorだけによる隔離の説明に優先する。
+
 > Status: reviewed and amended on 2026-07-17. This document is the long-form
 > design. The decisions in the following section and in
 > [plan-review.md](./plan-review.md) supersede older alternatives that remain as

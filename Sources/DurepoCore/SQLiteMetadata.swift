@@ -174,7 +174,18 @@ final class SQLiteMetadata {
                 created_at REAL NOT NULL
             )
             """)
-        try execute("PRAGMA user_version=6")
+        try execute("""
+            CREATE TABLE IF NOT EXISTS deleted_manifests (
+                manifest_file TEXT PRIMARY KEY
+            )
+            """)
+        try execute("""
+            CREATE TABLE IF NOT EXISTS store_integrity_failure (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                message TEXT NOT NULL
+            )
+            """)
+        try execute("PRAGMA user_version=7")
     }
 
     deinit { sqlite3_close(database) }
@@ -189,6 +200,38 @@ final class SQLiteMetadata {
     func indexEntries(_ manifest: SnapshotManifest) throws {
         try transaction {
             try replaceSnapshotEntries(snapshotID: manifest.id, entries: manifest.entries)
+        }
+    }
+
+    func recoverSnapshot(_ manifest: SnapshotManifest, manifestFile: String) throws {
+        try transaction {
+            let previous = try indexedSnapshotID(repositoryID: manifest.repositoryID)
+            if let previous { try setSnapshotProtected(id: previous, isProtected: true) }
+            try upsertSnapshot(manifest, manifestFile: manifestFile, healthState: .anomalous)
+            try replaceSnapshotEntries(snapshotID: manifest.id, entries: manifest.entries)
+            try setSnapshotProtected(id: manifest.id, isProtected: true)
+            try insertProtectionAlert(
+                repositoryID: manifest.repositoryID,
+                snapshotID: manifest.id,
+                protectedSnapshotID: previous,
+                anomaly: RepositoryAnomaly(
+                    kind: .snapshotRecovery,
+                    message: "An interrupted snapshot was recovered. Recovery points are protected until you review this alert."
+                )
+            )
+        }
+    }
+
+    func deletedManifestFiles() throws -> Set<String> {
+        try withStatement("SELECT manifest_file FROM deleted_manifests") { statement in
+            var result: Set<String> = []
+            var status = try step(statement)
+            while status == SQLITE_ROW {
+                result.insert(text(statement, 0))
+                status = try step(statement)
+            }
+            guard status == SQLITE_DONE else { throw databaseError() }
+            return result
         }
     }
 
@@ -278,7 +321,7 @@ final class SQLiteMetadata {
     func currentEntries(repositoryID: UUID) throws -> [String: IndexedSnapshotEntry]? {
         let hasIndex = try withStatement("SELECT 1 FROM repository_indexes WHERE repository_id = ?") { statement in
             bind(repositoryID.uuidString, at: 1, in: statement)
-            return sqlite3_step(statement) == SQLITE_ROW
+            return try step(statement) == SQLITE_ROW
         }
         guard hasIndex else { return nil }
 
@@ -291,7 +334,7 @@ final class SQLiteMetadata {
             """) { statement in
                 bind(repositoryID.uuidString, at: 1, in: statement)
                 var result: [String: IndexedSnapshotEntry] = [:]
-                while sqlite3_step(statement) == SQLITE_ROW {
+                while try step(statement) == SQLITE_ROW {
                     let relativePath = text(statement, 0)
                     guard let kind = SnapshotEntryKind(rawValue: text(statement, 1)) else { continue }
                     let entry = SnapshotEntry(
@@ -421,7 +464,7 @@ final class SQLiteMetadata {
             ORDER BY older.created_at DESC, older.rowid DESC LIMIT 1
             """) { statement in
                 bind(snapshotID.uuidString, at: 1, in: statement)
-                guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+                guard try step(statement) == SQLITE_ROW else { return nil }
                 return UUID(uuidString: text(statement, 0))
             }
     }
@@ -429,14 +472,14 @@ final class SQLiteMetadata {
     func containsSnapshot(id: UUID) throws -> Bool {
         try withStatement("SELECT 1 FROM snapshots WHERE id = ? LIMIT 1") { statement in
             bind(id.uuidString, at: 1, in: statement)
-            return sqlite3_step(statement) == SQLITE_ROW
+            return try step(statement) == SQLITE_ROW
         }
     }
 
     func containsSnapshotEntries(id: UUID) throws -> Bool {
         try withStatement("SELECT 1 FROM snapshot_entries WHERE snapshot_id = ? LIMIT 1") { statement in
             bind(id.uuidString, at: 1, in: statement)
-            return sqlite3_step(statement) == SQLITE_ROW
+            return try step(statement) == SQLITE_ROW
         }
     }
 
@@ -453,7 +496,7 @@ final class SQLiteMetadata {
                     sqlite3_bind_int64(statement, 2, Int64(boundedLimit + 1))
                     sqlite3_bind_int64(statement, 3, Int64(boundedOffset))
                     var result: [SnapshotDiffEntry] = []
-                    while sqlite3_step(statement) == SQLITE_ROW {
+                    while try step(statement) == SQLITE_ROW {
                         guard let entryKind = SnapshotEntryKind(rawValue: text(statement, 1)) else { continue }
                         result.append(SnapshotDiffEntry(
                             relativePath: text(statement, 0),
@@ -509,7 +552,7 @@ final class SQLiteMetadata {
                 sqlite3_bind_int64(statement, 5, Int64(boundedLimit + 1))
                 sqlite3_bind_int64(statement, 6, Int64(boundedOffset))
                 var result: [SnapshotDiffEntry] = []
-                while sqlite3_step(statement) == SQLITE_ROW {
+                while try step(statement) == SQLITE_ROW {
                     guard let kind = SnapshotDiffKind(rawValue: text(statement, 1)),
                           let entryKind = SnapshotEntryKind(rawValue: text(statement, 2)) else { continue }
                     result.append(SnapshotDiffEntry(
@@ -540,7 +583,7 @@ final class SQLiteMetadata {
                 sqlite3_bind_int64(statement, 2, Int64(boundedLimit + 1))
                 sqlite3_bind_int64(statement, 3, Int64(boundedOffset))
                 var result: [SnapshotDiffEntry] = []
-                while sqlite3_step(statement) == SQLITE_ROW {
+                while try step(statement) == SQLITE_ROW {
                     guard let entryKind = SnapshotEntryKind(rawValue: text(statement, 1)) else { continue }
                     result.append(SnapshotDiffEntry(
                         relativePath: text(statement, 0),
@@ -575,7 +618,7 @@ final class SQLiteMetadata {
             }
             sqlite3_bind_int64(statement, bindIndex, Int64(limit))
             var result: [SnapshotSummary] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 guard let id = UUID(uuidString: text(statement, 0)),
                       let repositoryID = UUID(uuidString: text(statement, 1)),
                       let reason = SnapshotReason(rawValue: text(statement, 4)),
@@ -606,7 +649,7 @@ final class SQLiteMetadata {
             """
         return try withStatement(sql) { statement in
             var alerts: [ProtectionAlert] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 guard let id = UUID(uuidString: text(statement, 0)),
                       let repositoryID = UUID(uuidString: text(statement, 1)),
                       let kind = RepositoryAnomalyKind(rawValue: text(statement, 4)) else { continue }
@@ -655,7 +698,7 @@ final class SQLiteMetadata {
     func hasRestoreSuppression(repositoryID: UUID) throws -> Bool {
         try withStatement("SELECT 1 FROM restore_suppressions WHERE repository_id = ? LIMIT 1") { statement in
             bind(repositoryID.uuidString, at: 1, in: statement)
-            return sqlite3_step(statement) == SQLITE_ROW
+            return try step(statement) == SQLITE_ROW
         }
     }
 
@@ -690,7 +733,7 @@ final class SQLiteMetadata {
     private func indexedSnapshotID(repositoryID: UUID) throws -> UUID? {
         try withStatement("SELECT snapshot_id FROM repository_indexes WHERE repository_id = ?") { statement in
             bind(repositoryID.uuidString, at: 1, in: statement)
-            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            guard try step(statement) == SQLITE_ROW else { return nil }
             return UUID(uuidString: text(statement, 0))
         }
     }
@@ -701,13 +744,13 @@ final class SQLiteMetadata {
             WHERE repository_id = ? AND acknowledged_at IS NULL LIMIT 1
             """) { statement in
                 bind(repositoryID.uuidString, at: 1, in: statement)
-                return sqlite3_step(statement) == SQLITE_ROW
+                return try step(statement) == SQLITE_ROW
             }
     }
 
     func hasAnyActiveProtectionAlert() throws -> Bool {
         try withStatement("SELECT 1 FROM protection_alerts WHERE acknowledged_at IS NULL LIMIT 1") { statement in
-            sqlite3_step(statement) == SQLITE_ROW
+            try step(statement) == SQLITE_ROW
         }
     }
 
@@ -748,7 +791,7 @@ final class SQLiteMetadata {
     func manifestFile(id: UUID) throws -> String? {
         try withStatement("SELECT manifest_file FROM snapshots WHERE id = ?") { statement in
             bind(id.uuidString, at: 1, in: statement)
-            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            guard try step(statement) == SQLITE_ROW else { return nil }
             return text(statement, 0)
         }
     }
@@ -760,13 +803,20 @@ final class SQLiteMetadata {
             """) { statement in
                 bind(repositoryID.uuidString, at: 1, in: statement)
                 var result: [String] = []
-                while sqlite3_step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
+                while try step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
                 return result
             }
     }
 
     func deleteRepositoryData(repositoryID: UUID) throws {
         try transaction {
+            try withStatement("""
+                INSERT OR IGNORE INTO deleted_manifests(manifest_file)
+                SELECT manifest_file FROM snapshots WHERE repository_id = ?
+                """) { statement in
+                    bind(repositoryID.uuidString, at: 1, in: statement)
+                    try stepDone(statement)
+                }
             try withStatement("""
                 DELETE FROM snapshot_entries WHERE snapshot_id IN (
                     SELECT id FROM snapshots WHERE repository_id = ?
@@ -791,10 +841,31 @@ final class SQLiteMetadata {
     func repositoryIDs() throws -> [UUID] {
         try withStatement("SELECT DISTINCT repository_id FROM snapshots") { statement in
             var result: [UUID] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 if let id = UUID(uuidString: text(statement, 0)) { result.append(id) }
             }
             return result
+        }
+    }
+
+    func integrityFailure() throws -> String? {
+        try withStatement("SELECT message FROM store_integrity_failure WHERE id = 1") { statement in
+            guard try step(statement) == SQLITE_ROW else { return nil }
+            return text(statement, 0)
+        }
+    }
+
+    func setIntegrityFailure(_ message: String?) throws {
+        if let message {
+            try withStatement("""
+                INSERT INTO store_integrity_failure(id, message) VALUES(1, ?)
+                ON CONFLICT(id) DO UPDATE SET message = excluded.message
+                """) { statement in
+                    bind(message, at: 1, in: statement)
+                    try stepDone(statement)
+                }
+        } else {
+            try execute("DELETE FROM store_integrity_failure WHERE id = 1")
         }
     }
 
@@ -802,7 +873,7 @@ final class SQLiteMetadata {
         let pragma = quick ? "PRAGMA quick_check" : "PRAGMA integrity_check"
         return try withStatement(pragma) { statement in
             var messages: [String] = []
-            while sqlite3_step(statement) == SQLITE_ROW { messages.append(text(statement, 0)) }
+            while try step(statement) == SQLITE_ROW { messages.append(text(statement, 0)) }
             return messages
         }
     }
@@ -810,7 +881,7 @@ final class SQLiteMetadata {
     func integrityOverview() throws -> MetadataIntegrityOverview {
         let manifestFiles = try withStatement("SELECT manifest_file FROM snapshots") { statement in
             var result: [String] = []
-            while sqlite3_step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
+            while try step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
             return result
         }
         let referencedHashes = try withStatement("""
@@ -818,14 +889,14 @@ final class SQLiteMetadata {
             WHERE kind = 'file' AND content_hash IS NOT NULL
             """) { statement in
             var result: Set<String> = []
-            while sqlite3_step(statement) == SQLITE_ROW { result.insert(text(statement, 0)) }
+            while try step(statement) == SQLITE_ROW { result.insert(text(statement, 0)) }
             return result
         }
         let missingContentHashCount = try withStatement("""
             SELECT COUNT(*) FROM snapshot_entries
             WHERE kind = 'file' AND content_hash IS NULL
             """) { statement in
-            guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+            guard try step(statement) == SQLITE_ROW else { return 0 }
             return Int(sqlite3_column_int64(statement, 0))
         }
         return MetadataIntegrityOverview(
@@ -844,10 +915,14 @@ final class SQLiteMetadata {
                     AND id NOT IN (SELECT snapshot_id FROM repository_indexes)
                 ORDER BY created_at ASC LIMIT 1
                 """) { statement -> (id: String, file: String)? in
-                    guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+                    guard try step(statement) == SQLITE_ROW else { return nil }
                     return (text(statement, 0), text(statement, 1))
                 }
             guard let candidate else { return nil }
+            try withStatement("INSERT OR IGNORE INTO deleted_manifests(manifest_file) VALUES(?)") { statement in
+                bind(candidate.file, at: 1, in: statement)
+                try stepDone(statement)
+            }
             try withStatement("DELETE FROM snapshot_entries WHERE snapshot_id = ?") { statement in
                 bind(candidate.id, at: 1, in: statement)
                 try stepDone(statement)
@@ -867,7 +942,7 @@ final class SQLiteMetadata {
                 WHERE repository_id = ? AND acknowledged_at IS NULL LIMIT 1
                 """) { statement in
                     bind(repositoryID.uuidString, at: 1, in: statement)
-                    return sqlite3_step(statement) == SQLITE_ROW
+                    return try step(statement) == SQLITE_ROW
                 }
             if hasActiveAlert { return [] }
             let files = try withStatement("""
@@ -877,9 +952,17 @@ final class SQLiteMetadata {
                     bind(repositoryID.uuidString, at: 1, in: statement)
                     sqlite3_bind_int64(statement, 2, Int64(count))
                     var result: [String] = []
-                    while sqlite3_step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
+                    while try step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
                     return result
                 }
+            try withStatement("INSERT OR IGNORE INTO deleted_manifests(manifest_file) VALUES(?)") { statement in
+                for file in files {
+                    bind(file, at: 1, in: statement)
+                    try stepDone(statement)
+                    sqlite3_reset(statement)
+                    sqlite3_clear_bindings(statement)
+                }
+            }
             try withStatement("""
                 DELETE FROM snapshot_entries WHERE snapshot_id IN (
                     SELECT id FROM snapshots WHERE repository_id = ? AND is_protected = 0
@@ -997,7 +1080,7 @@ final class SQLiteMetadata {
                 bind(repositoryID.uuidString, at: 1, in: statement)
                 sqlite3_bind_int64(statement, 2, committed)
                 sqlite3_bind_int64(statement, 3, event)
-                guard sqlite3_step(statement) == SQLITE_ROW else { return true }
+                guard try step(statement) == SQLITE_ROW else { return true }
                 return sqlite3_column_int(statement, 0) != 0
             }
         let paths = try withStatement("""
@@ -1009,7 +1092,7 @@ final class SQLiteMetadata {
                 sqlite3_bind_int64(statement, 2, committed)
                 sqlite3_bind_int64(statement, 3, event)
                 var result: [String] = []
-                while sqlite3_step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
+                while try step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
                 return result
             }
         return SnapshotChangeSet(
@@ -1024,7 +1107,7 @@ final class SQLiteMetadata {
             FROM monitor_state WHERE repository_id = ?
             """) { statement in
                 bind(repositoryID.uuidString, at: 1, in: statement)
-                guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+                guard try step(statement) == SQLITE_ROW else { return nil }
                 return RepositoryMonitorState(
                     lastSeenEventID: UInt64(max(0, sqlite3_column_int64(statement, 0))),
                     lastCommittedEventID: UInt64(max(0, sqlite3_column_int64(statement, 1))),
@@ -1089,7 +1172,7 @@ final class SQLiteMetadata {
 
     func agentHealth() throws -> AgentHealth? {
         try withStatement("SELECT error_id, message, updated_at FROM agent_errors ORDER BY updated_at DESC LIMIT 1") { statement in
-            guard sqlite3_step(statement) == SQLITE_ROW,
+            guard try step(statement) == SQLITE_ROW,
                   let id = UUID(uuidString: text(statement, 0)) else { return nil }
             return AgentHealth(errorID: id, message: text(statement, 1), updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)))
         }
@@ -1098,14 +1181,14 @@ final class SQLiteMetadata {
     private func monitorIdentity(repositoryID: UUID) throws -> (volumeID: String, rootID: String)? {
         try withStatement("SELECT volume_id, root_id FROM monitor_state WHERE repository_id = ?") { statement in
             bind(repositoryID.uuidString, at: 1, in: statement)
-            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            guard try step(statement) == SQLITE_ROW else { return nil }
             return (text(statement, 0), text(statement, 1))
         }
     }
 
     private func hasColumn(_ column: String, in table: String) throws -> Bool {
         try withStatement("PRAGMA table_info(\(table))") { statement in
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 if text(statement, 1) == column { return true }
             }
             return false
@@ -1191,8 +1274,14 @@ final class SQLiteMetadata {
         return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, index)))
     }
 
+    private func step(_ statement: OpaquePointer) throws -> Int32 {
+        let result = sqlite3_step(statement)
+        guard result == SQLITE_ROW || result == SQLITE_DONE else { throw databaseError() }
+        return result
+    }
+
     private func stepDone(_ statement: OpaquePointer) throws {
-        guard sqlite3_step(statement) == SQLITE_DONE else { throw databaseError() }
+        guard try step(statement) == SQLITE_DONE else { throw databaseError() }
     }
 
     private func databaseError() -> Error {

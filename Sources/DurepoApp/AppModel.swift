@@ -9,6 +9,7 @@ struct AppAlert: Identifiable {
     let id = UUID()
     let title: String
     let message: String
+    var recoveryURL: URL? = nil
 }
 
 enum AppSection: Hashable {
@@ -32,6 +33,7 @@ final class AppModel {
     var agentStatus = SMAppService.Status.notRegistered
     var loginItemStatus = SMAppService.Status.notRegistered
     var integrityReport: StoreIntegrityReport?
+    var repositoryAccessErrors: [UUID: String] = [:]
 
     private let storageURL: URL
     private let registry: RepositoryRegistry
@@ -40,6 +42,9 @@ final class AppModel {
     private let store: SnapshotStore
     private var pendingAgentHandoffURLs: [UUID: URL] = [:]
     private var presentedAgentErrorID: UUID?
+    private var handoffCleanupTask: Task<Void, Never>?
+    private var operationID: UUID?
+    private var refreshErrorMessage: String?
 
     init() {
         let resolvedStorage: URL
@@ -79,36 +84,64 @@ final class AppModel {
                 }
                 let latestProtectionAlerts = try await store.protectionAlerts()
                 if latestProtectionAlerts != protectionAlerts { protectionAlerts = latestProtectionAlerts }
+                if !isBusy {
+                    let loaded = try await registry.records()
+                    if !isBusy {
+                        applyRepositoryRecords(loaded)
+                        await prepareAgentHandoffs(for: loaded)
+                    }
+                }
                 refreshServiceStatuses()
                 try await refreshAgentHealth()
+                refreshErrorMessage = nil
             } catch is CancellationError {
                 return
             } catch {
-                // A later refresh retries transient cross-process I/O failures.
+                if refreshErrorMessage != error.localizedDescription {
+                    refreshErrorMessage = error.localizedDescription
+                    present(error)
+                }
             }
         }
     }
 
     func load() async {
+        var failures: [String] = []
         do {
             globalExclusionRules = try exclusionRuleStore.rules()
-            var loadedRepositories = try await registry.records()
-            loadedRepositories = try await prepareAgentHandoffs(for: loadedRepositories)
-            repositories = loadedRepositories.sorted { $0.displayName < $1.displayName }
-            snapshots = try await store.snapshotSummaries()
-            protectionAlerts = try await store.protectionAlerts()
-            if selectedRepositoryID == nil {
-                selectedRepositoryID = repositories.first?.id
-            }
-            refreshServiceStatuses()
-            try await refreshAgentHealth()
-            scheduleAgentHandoffCleanup()
         } catch {
-            present(error)
+            failures.append(error.localizedDescription)
+        }
+        do {
+            applyRepositoryRecords(try await registry.records())
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+        do {
+            snapshots = try await store.snapshotSummaries()
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+        do {
+            protectionAlerts = try await store.protectionAlerts()
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+        refreshServiceStatuses()
+        await prepareAgentHandoffs(for: repositories)
+        do {
+            try await refreshAgentHealth()
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+        if !failures.isEmpty {
+            alert = AppAlert(title: String(localized: "Durepo Error"), message: failures.joined(separator: "\n"))
         }
     }
 
     func addRepository() async {
+        guard beginOperation(String(localized: "Optimizing exclusion rules…")) else { return }
+        defer { endOperation() }
         let panel = NSOpenPanel()
         panel.title = String(localized: "Choose a repository to protect")
         panel.prompt = String(localized: "Protect")
@@ -121,7 +154,8 @@ final class AppModel {
         do {
             let didAccess = url.startAccessingSecurityScopedResource()
             guard didAccess else { throw DurepoError.bookmarkAccessDenied }
-            defer { url.stopAccessingSecurityScopedResource() }
+            var accessTransferred = false
+            defer { if !accessTransferred { url.stopAccessingSecurityScopedResource() } }
             let bookmark = try url.bookmarkData(
                 options: [.withSecurityScope],
                 includingResourceValuesForKeys: nil,
@@ -132,64 +166,75 @@ final class AppModel {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
-            isBusy = true
-            progressDescription = String(localized: "Optimizing exclusion rules…")
-            let optimizedRules: [String]
-            do {
-                let optimization = try await exclusionOptimizer.optimize(
-                    repositoryURL: url,
-                    including: globalExclusionRules,
-                    minimumConfidence: .high
-                )
-                optimizedRules = optimization.rules
-            } catch {
-                isBusy = false
-                progressDescription = ""
-                throw error
-            }
-            isBusy = false
-            progressDescription = ""
+            let optimization = try await exclusionOptimizer.optimize(
+                repositoryURL: url,
+                including: globalExclusionRules,
+                minimumConfidence: .high
+            )
             let record = RepositoryRecord(
                 displayName: url.lastPathComponent,
                 bookmark: bookmark,
                 handoffBookmark: handoffBookmark,
-                customExclusionRules: optimizedRules
+                customExclusionRules: optimization.suggestions.isEmpty ? nil : optimization.rules
             )
             try await registry.add(record)
+            repositories.append(record)
+            repositories.sort { $0.displayName < $1.displayName }
+            pendingAgentHandoffURLs[record.id] = url
+            accessTransferred = true
+            scheduleAgentHandoffCleanup()
             do {
                 try await snapshot(record, reason: .initial)
-                repositories.append(record)
-                repositories.sort { $0.displayName < $1.displayName }
-                selectedRepositoryID = record.id
-                selection = .repositories
             } catch {
-                try? await registry.remove(id: record.id)
+                let snapshotError = error
+                do {
+                    try await registry.remove(id: record.id)
+                    repositories.removeAll { $0.id == record.id }
+                    pendingAgentHandoffURLs.removeValue(forKey: record.id)?.stopAccessingSecurityScopedResource()
+                } catch {
+                    repositoryAccessErrors[record.id] = error.localizedDescription
+                    alert = AppAlert(
+                        title: String(localized: "Durepo Error"),
+                        message: "\(snapshotError.localizedDescription)\n\(error.localizedDescription)"
+                    )
+                    return
+                }
                 throw error
             }
+            selectedRepositoryID = record.id
+            selection = .repositories
+            applyRepositoryRecords(try await registry.records())
         } catch {
-            isBusy = false
-            progressDescription = ""
             present(error)
         }
     }
 
     func remove(_ record: RepositoryRecord, deletionMode: SnapshotDeletionMode) async {
-        isBusy = true
-        progressDescription = String(localized: "Deleting snapshots…")
-        defer {
-            isBusy = false
-            progressDescription = ""
-        }
+        guard beginOperation(String(localized: "Deleting snapshots…")) else { return }
+        defer { endOperation() }
         do {
-            try await registry.remove(id: record.id)
+            let removedRecord = try await registry.remove(id: record.id)
             do {
                 _ = try await store.deleteSnapshots(repositoryID: record.id, mode: deletionMode)
             } catch {
-                try? await registry.add(record)
+                let deletionError = error
+                if let removedRecord {
+                    do {
+                        try await registry.add(removedRecord)
+                    } catch {
+                        alert = AppAlert(
+                            title: String(localized: "Durepo Error"),
+                            message: "\(deletionError.localizedDescription)\n\(error.localizedDescription)"
+                        )
+                        return
+                    }
+                }
                 throw error
             }
             repositories.removeAll { $0.id == record.id }
             snapshots.removeAll { $0.repositoryID == record.id }
+            repositoryAccessErrors.removeValue(forKey: record.id)
+            pendingAgentHandoffURLs.removeValue(forKey: record.id)?.stopAccessingSecurityScopedResource()
             if selectedRepositoryID == record.id {
                 selectedRepositoryID = repositories.first?.id
             }
@@ -199,6 +244,8 @@ final class AppModel {
     }
 
     func createSnapshot(of record: RepositoryRecord) async {
+        guard beginOperation(String(localized: "Preparing snapshot…")) else { return }
+        defer { endOperation() }
         do {
             try await snapshot(record, reason: .manual)
         } catch {
@@ -207,6 +254,8 @@ final class AppModel {
     }
 
     func createSnapshotsForAllRepositories() async {
+        guard beginOperation(String(localized: "Preparing snapshot…")) else { return }
+        defer { endOperation() }
         for repository in repositories where repository.isEnabled {
             do {
                 try await snapshot(repository, reason: .manual)
@@ -218,12 +267,8 @@ final class AppModel {
     }
 
     func runIntegrityCheck() async {
-        isBusy = true
-        progressDescription = String(localized: "Checking storage integrity…")
-        defer {
-            isBusy = false
-            progressDescription = ""
-        }
+        guard beginOperation(String(localized: "Checking storage integrity…")) else { return }
+        defer { endOperation() }
         do {
             integrityReport = try await store.checkIntegrity()
         } catch {
@@ -232,12 +277,8 @@ final class AppModel {
     }
 
     func garbageCollect() async {
-        isBusy = true
-        progressDescription = String(localized: "Reclaiming unreferenced data…")
-        defer {
-            isBusy = false
-            progressDescription = ""
-        }
+        guard beginOperation(String(localized: "Reclaiming unreferenced data…")) else { return }
+        defer { endOperation() }
         do {
             _ = try await store.garbageCollect()
             integrityReport = try await store.checkIntegrity(deep: false)
@@ -263,6 +304,8 @@ final class AppModel {
     }
 
     func acknowledge(_ alert: ProtectionAlert) async {
+        guard beginOperation("") else { return }
+        defer { endOperation() }
         do {
             try await store.acknowledgeProtectionAlert(id: alert.id)
             protectionAlerts.removeAll { $0.id == alert.id }
@@ -272,6 +315,8 @@ final class AppModel {
     }
 
     func setSnapshotProtected(_ summary: SnapshotSummary, isProtected: Bool) async {
+        guard beginOperation("") else { return }
+        defer { endOperation() }
         do {
             try await store.setSnapshotProtected(id: summary.id, isProtected: isProtected)
             if let index = snapshots.firstIndex(where: { $0.id == summary.id }) {
@@ -309,6 +354,8 @@ final class AppModel {
             String(localized: "The repository file count dropped sharply. The last healthy snapshot is protected.")
         case .massZeroByte:
             String(localized: "Many files were reduced to zero bytes. The last healthy snapshot is protected.")
+        case .snapshotRecovery:
+            String(localized: "A snapshot was recovered after an interrupted operation. Review it before acknowledging this alert.")
         }
     }
 
@@ -317,9 +364,10 @@ final class AppModel {
     }
 
     func updateGlobalExclusionRules(_ rules: [String]) {
-        globalExclusionRules = rules
+        guard !isBusy else { return }
         do {
             try exclusionRuleStore.save(rules)
+            globalExclusionRules = rules
             let inheritingRepositoryIDs = repositories
                 .filter { $0.customExclusionRules == nil }
                 .map(\.id)
@@ -338,11 +386,11 @@ final class AppModel {
         }
     }
 
-    func saveExclusionRules(_ rules: [String], for record: RepositoryRecord) async -> Bool {
-        var updated = record
-        updated.customExclusionRules = ExclusionRuleSet(rules).rules
+    func saveExclusionRules(_ rules: [String]?, for record: RepositoryRecord) async -> Bool {
+        guard beginOperation("") else { return false }
+        defer { endOperation() }
         do {
-            try await registry.update(updated)
+            let updated = try await registry.updateExclusionRules(id: record.id, rules: rules)
             if let index = repositories.firstIndex(where: { $0.id == updated.id }) {
                 repositories[index] = updated
             }
@@ -358,6 +406,8 @@ final class AppModel {
         for record: RepositoryRecord,
         existingRules: [String]
     ) async -> RepositoryExclusionOptimizationResult? {
+        guard beginOperation(String(localized: "Optimizing exclusion rules…")) else { return nil }
+        defer { endOperation() }
         do {
             var stale = false
             let url = try URL(
@@ -382,6 +432,8 @@ final class AppModel {
     }
 
     func restore(_ summary: SnapshotSummary) async {
+        guard beginOperation(String(localized: "Verifying and restoring…")) else { return }
+        defer { endOperation() }
         let panel = NSOpenPanel()
         panel.title = String(localized: "Choose a parent folder for the restore")
         panel.prompt = String(localized: "Choose")
@@ -396,12 +448,6 @@ final class AppModel {
             path: "\(summary.repositoryName)-Durepo-\(formatter.string(from: summary.createdAt))",
             directoryHint: .isDirectory
         )
-        isBusy = true
-        progressDescription = String(localized: "Verifying and restoring…")
-        defer {
-            isBusy = false
-            progressDescription = ""
-        }
         do {
             let manifest = try await store.manifest(id: summary.id)
             let didAccess = parent.startAccessingSecurityScopedResource()
@@ -414,26 +460,18 @@ final class AppModel {
         }
     }
 
-    func snapshotDiff(_ summary: SnapshotSummary, offset: Int, limit: Int = 500) async -> SnapshotDiffPage? {
-        do {
-            return try await store.snapshotDiff(id: summary.id, offset: offset, limit: limit)
-        } catch {
-            present(error)
-            return nil
-        }
+    func snapshotDiff(_ summary: SnapshotSummary, offset: Int, limit: Int = 500) async throws -> SnapshotDiffPage {
+        try await store.snapshotDiff(id: summary.id, offset: offset, limit: limit)
     }
 
-    func snapshotEntries(_ summary: SnapshotSummary, offset: Int, limit: Int = 500) async -> SnapshotDiffPage? {
-        do {
-            return try await store.snapshotEntries(id: summary.id, offset: offset, limit: limit)
-        } catch {
-            present(error)
-            return nil
-        }
+    func snapshotEntries(_ summary: SnapshotSummary, offset: Int, limit: Int = 500) async throws -> SnapshotDiffPage {
+        try await store.snapshotEntries(id: summary.id, offset: offset, limit: limit)
     }
 
     func restore(_ summary: SnapshotSummary, selecting paths: Set<String>) async {
         guard !paths.isEmpty else { return }
+        guard beginOperation(String(localized: "Verifying and restoring selection…")) else { return }
+        defer { endOperation() }
         let panel = NSOpenPanel()
         panel.title = String(localized: "Choose a parent folder for the restore")
         panel.prompt = String(localized: "Choose")
@@ -448,12 +486,6 @@ final class AppModel {
             path: "\(summary.repositoryName)-Durepo-Selection-\(formatter.string(from: summary.createdAt))",
             directoryHint: .isDirectory
         )
-        isBusy = true
-        progressDescription = String(localized: "Verifying and restoring selection…")
-        defer {
-            isBusy = false
-            progressDescription = ""
-        }
         do {
             let manifest = try await store.manifest(id: summary.id)
             let didAccess = parent.startAccessingSecurityScopedResource()
@@ -467,15 +499,11 @@ final class AppModel {
     }
 
     func restoreInPlace(_ summary: SnapshotSummary) async {
+        guard beginOperation(String(localized: "Creating a pre-restore snapshot…")) else { return }
+        defer { endOperation() }
         guard let record = repositories.first(where: { $0.id == summary.repositoryID }) else {
             present(DurepoError.repositoryNotRegistered)
             return
-        }
-        isBusy = true
-        progressDescription = String(localized: "Creating a pre-restore snapshot…")
-        defer {
-            isBusy = false
-            progressDescription = ""
         }
         do {
             var stale = false
@@ -496,8 +524,44 @@ final class AppModel {
                 exclusionRules: record.effectiveExclusionRules(globalRules: globalExclusionRules),
                 requiresRegisteredRepository: true
             )
-            snapshots = try await store.snapshotSummaries()
+            var message = String(
+                format: String(localized: "The repository was restored. The previous folder is kept at:\n%@\nKeep this folder until you have verified the restored repository."),
+                result.rollbackURL.path
+            )
+            do {
+                // Retain the selected URL's sandbox extension while rebinding the exchanged root.
+                try await reconnectRestoredRepository(record, at: url)
+            } catch {
+                let accessMessage = String(
+                    format: String(localized: "Background protection could not be reconnected to the restored folder: %@"),
+                    error.localizedDescription
+                )
+                message += "\n\n" + accessMessage
+                repositoryAccessErrors[record.id] = accessMessage
+                do {
+                    let paused = try await registry.setEnabled(id: record.id, isEnabled: false)
+                    if let index = repositories.firstIndex(where: { $0.id == record.id }) {
+                        repositories[index] = paused
+                    }
+                    _ = try await store.recordAgentError(repositoryID: record.id, message: accessMessage)
+                } catch {
+                    message += "\n\n" + error.localizedDescription
+                }
+            }
+            do {
+                snapshots = try await store.snapshotSummaries()
+            } catch {
+                message += "\n\n" + String(
+                    format: String(localized: "The snapshot list could not be refreshed: %@"),
+                    error.localizedDescription
+                )
+            }
             NSWorkspace.shared.activateFileViewerSelecting([result.restoredURL])
+            alert = AppAlert(
+                title: String(localized: "Restore Complete"),
+                message: message,
+                recoveryURL: result.rollbackURL
+            )
         } catch {
             present(error)
         }
@@ -507,11 +571,32 @@ final class AppModel {
         agentStatus == .enabled
     }
 
+    func reconnectRepository(_ record: RepositoryRecord) async {
+        guard beginOperation(String(localized: "Reconnecting repository…")) else { return }
+        defer { endOperation() }
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "Choose the repository folder to reconnect")
+        panel.prompt = String(localized: "Reconnect")
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try await reconnectRestoredRepository(record, at: url, enableProtection: true)
+            repositoryAccessErrors.removeValue(forKey: record.id)
+        } catch {
+            repositoryAccessErrors[record.id] = error.localizedDescription
+            present(error)
+        }
+    }
+
     var launchesAtLogin: Bool {
         loginItemStatus == .enabled
     }
 
     func setAgentEnabled(_ isEnabled: Bool) {
+        guard !isBusy else { return }
         do {
             if isEnabled {
                 try agentService.register()
@@ -526,6 +611,7 @@ final class AppModel {
     }
 
     func setLaunchesAtLogin(_ isEnabled: Bool) {
+        guard !isBusy else { return }
         do {
             if isEnabled {
                 try loginItemService.register()
@@ -564,13 +650,15 @@ final class AppModel {
             throw DurepoError.bookmarkAccessDenied
         }
         defer { url.stopAccessingSecurityScopedResource() }
-
-        isBusy = true
-        progressDescription = String(localized: "Preparing snapshot…")
-        defer {
-            isBusy = false
-            progressDescription = ""
+        if stale {
+            let bookmark = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+            let updated = try await registry.updateAppBookmark(id: record.id, bookmark: bookmark)
+            if let index = repositories.firstIndex(where: { $0.id == record.id }) {
+                repositories[index] = updated
+            }
         }
+        progressDescription = String(localized: "Preparing snapshot…")
+        let currentOperation = operationID
         let manifest = try await store.createSnapshot(
             repositoryURL: url,
             repositoryID: record.id,
@@ -579,7 +667,8 @@ final class AppModel {
             requiresRegisteredRepository: true,
             progress: { [weak self] progress in
                 Task { @MainActor in
-                    self?.progressDescription = String(
+                    guard let self, self.operationID == currentOperation else { return }
+                    self.progressDescription = String(
                         format: String(localized: "%lld files • %@"),
                         Int64(progress.filesProcessed),
                         progress.currentPath
@@ -590,58 +679,129 @@ final class AppModel {
         snapshots.insert(SnapshotSummary(manifest: manifest), at: 0)
     }
 
-    private func prepareAgentHandoffs(for records: [RepositoryRecord]) async throws -> [RepositoryRecord] {
-        var prepared = records
-        for index in prepared.indices where prepared[index].agentBookmark == nil {
-            var record = prepared[index]
-            var stale = false
-            let url = try URL(
-                resolvingBookmarkData: record.bookmark,
-                options: [.withSecurityScope],
-                relativeTo: nil,
-                bookmarkDataIsStale: &stale
-            )
-            guard url.startAccessingSecurityScopedResource() else {
-                throw DurepoError.bookmarkAccessDenied
-            }
+    private func prepareAgentHandoffs(for records: [RepositoryRecord]) async {
+        for record in records where record.agentBookmark == nil && pendingAgentHandoffURLs[record.id] == nil {
             do {
-                record.handoffBookmark = try url.bookmarkData(
-                    options: [],
-                    includingResourceValuesForKeys: nil,
-                    relativeTo: nil
-                )
-                try await registry.update(record)
-                pendingAgentHandoffURLs[record.id] = url
-                prepared[index] = record
+                let updated = try await prepareAgentHandoff(for: record)
+                if let index = repositories.firstIndex(where: { $0.id == record.id }) {
+                    repositories[index] = updated
+                }
+                repositoryAccessErrors.removeValue(forKey: record.id)
             } catch {
-                url.stopAccessingSecurityScopedResource()
-                throw error
+                repositoryAccessErrors[record.id] = error.localizedDescription
             }
-        }
-        return prepared
-    }
-
-    private func scheduleAgentHandoffCleanup() {
-        guard !pendingAgentHandoffURLs.isEmpty else { return }
-        Task { [weak self] in
-            try? await Task.sleep(for: .seconds(10))
-            await self?.releaseCompletedAgentHandoffs()
-        }
-    }
-
-    private func releaseCompletedAgentHandoffs() async {
-        guard let records = try? await registry.records() else {
-            scheduleAgentHandoffCleanup()
-            return
-        }
-        let completedIDs = Set(records.compactMap { $0.agentBookmark == nil ? nil : $0.id })
-        for id in completedIDs {
-            pendingAgentHandoffURLs.removeValue(forKey: id)?.stopAccessingSecurityScopedResource()
         }
         scheduleAgentHandoffCleanup()
     }
 
-    private func present(_ error: Error) {
+    private func prepareAgentHandoff(for record: RepositoryRecord) async throws -> RepositoryRecord {
+        var stale = false
+        let url = try URL(
+            resolvingBookmarkData: record.bookmark,
+            options: [.withSecurityScope],
+            relativeTo: nil,
+            bookmarkDataIsStale: &stale
+        )
+        guard url.startAccessingSecurityScopedResource() else {
+            throw DurepoError.bookmarkAccessDenied
+        }
+        var accessTransferred = false
+        defer { if !accessTransferred { url.stopAccessingSecurityScopedResource() } }
+        if stale {
+            let bookmark = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+            try await registry.updateAppBookmark(id: record.id, bookmark: bookmark)
+        }
+        let handoff = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+        let updated = try await registry.updateHandoffBookmark(id: record.id, bookmark: handoff)
+        if updated.agentBookmark == nil {
+            pendingAgentHandoffURLs.removeValue(forKey: record.id)?.stopAccessingSecurityScopedResource()
+            pendingAgentHandoffURLs[record.id] = url
+            accessTransferred = true
+        }
+        return updated
+    }
+
+    private func reconnectRestoredRepository(
+        _ record: RepositoryRecord,
+        at url: URL,
+        enableProtection: Bool? = nil
+    ) async throws {
+        guard url.startAccessingSecurityScopedResource() else {
+            throw DurepoError.bookmarkAccessDenied
+        }
+        var accessTransferred = false
+        defer { if !accessTransferred { url.stopAccessingSecurityScopedResource() } }
+        let bookmark = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+        let handoff = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+        let updated = try await registry.replaceRepositoryAccess(
+            id: record.id, bookmark: bookmark, handoffBookmark: handoff, isEnabled: enableProtection
+        )
+        pendingAgentHandoffURLs.removeValue(forKey: record.id)?.stopAccessingSecurityScopedResource()
+        pendingAgentHandoffURLs[record.id] = url
+        accessTransferred = true
+        if let index = repositories.firstIndex(where: { $0.id == record.id }) {
+            repositories[index] = updated
+        }
+        scheduleAgentHandoffCleanup()
+        try await store.requireFullScan(repositoryID: record.id)
+    }
+
+    private func scheduleAgentHandoffCleanup() {
+        guard !pendingAgentHandoffURLs.isEmpty, handoffCleanupTask == nil else { return }
+        handoffCleanupTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(10))
+                guard let self else { return }
+                self.handoffCleanupTask = nil
+                await self.releaseCompletedAgentHandoffs()
+            } catch is CancellationError {
+                self?.handoffCleanupTask = nil
+            } catch {
+                self?.handoffCleanupTask = nil
+                self?.present(error)
+            }
+        }
+    }
+
+    private func releaseCompletedAgentHandoffs() async {
+        do {
+            let records = try await registry.records()
+            let incompleteIDs = Set(records.filter { $0.agentBookmark == nil }.map(\.id))
+            for id in pendingAgentHandoffURLs.keys where !incompleteIDs.contains(id) {
+                pendingAgentHandoffURLs.removeValue(forKey: id)?.stopAccessingSecurityScopedResource()
+            }
+            if !isBusy { applyRepositoryRecords(records) }
+        } catch {
+            present(error)
+        }
+        scheduleAgentHandoffCleanup()
+    }
+
+    private func applyRepositoryRecords(_ records: [RepositoryRecord]) {
+        repositories = records.sorted { $0.displayName < $1.displayName }
+        let registeredIDs = Set(records.map(\.id))
+        let awaitingAccess = Set(records.filter { $0.agentBookmark == nil || !$0.isEnabled }.map(\.id))
+        repositoryAccessErrors = repositoryAccessErrors.filter { awaitingAccess.contains($0.key) }
+        if let selectedRepositoryID, !registeredIDs.contains(selectedRepositoryID) {
+            self.selectedRepositoryID = nil
+        }
+    }
+
+    private func beginOperation(_ description: String) -> Bool {
+        guard !isBusy else { return false }
+        operationID = UUID()
+        isBusy = true
+        progressDescription = description
+        return true
+    }
+
+    private func endOperation() {
+        operationID = nil
+        isBusy = false
+        progressDescription = ""
+    }
+
+    func present(_ error: Error) {
         alert = AppAlert(
             title: String(localized: "Durepo Error"),
             message: error.localizedDescription

@@ -50,7 +50,14 @@ public actor SnapshotStore {
         self.maximumStorageByteCount = max(1_048_576, maximumStorageByteCount)
     }
 
-    public func prepare() throws {
+    public func prepare() async throws {
+        if didReconcileMetadata && didCleanTemporaryFiles && metadata != nil { return }
+        let lock = try await FileOperationLock.acquire(at: lockURL)
+        defer { lock.release() }
+        try prepareUnlocked()
+    }
+
+    private func prepareUnlocked() throws {
         for directory in [storageURL, objectsURL, manifestsURL, temporaryURL] {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         }
@@ -77,9 +84,26 @@ public actor SnapshotStore {
         requiresRegisteredRepository: Bool = false,
         progress: (@Sendable (SnapshotProgress) -> Void)? = nil
     ) async throws -> SnapshotManifest {
-        try prepare()
-        let lockDescriptor = try acquireExclusiveStoreLock()
-        defer { releaseStoreLock(lockDescriptor) }
+        let lock = try await FileOperationLock.acquire(at: lockURL)
+        defer { lock.release() }
+        try prepareUnlocked()
+        return try await createSnapshotUnlocked(
+            repositoryURL: repositoryURL, repositoryID: repositoryID, reason: reason,
+            changeSet: changeSet, exclusionRules: exclusionRules, detectAnomalies: detectAnomalies,
+            requiresRegisteredRepository: requiresRegisteredRepository, progress: progress
+        )
+    }
+
+    private func createSnapshotUnlocked(
+        repositoryURL: URL,
+        repositoryID: UUID,
+        reason: SnapshotReason,
+        changeSet: SnapshotChangeSet? = nil,
+        exclusionRules: ExclusionRuleSet? = nil,
+        detectAnomalies: Bool = false,
+        requiresRegisteredRepository: Bool = false,
+        progress: (@Sendable (SnapshotProgress) -> Void)? = nil
+    ) async throws -> SnapshotManifest {
         if requiresRegisteredRepository {
             let records = try await RepositoryRegistry(storageURL: storageURL).records()
             guard records.contains(where: { $0.id == repositoryID && $0.isEnabled }) else {
@@ -134,6 +158,9 @@ public actor SnapshotStore {
         }
 
         let indexedEntries = work.entries.values.sorted { $0.entry.relativePath < $1.entry.relativePath }
+        if try metadataStore.integrityFailure() != nil {
+            try verify(entries: indexedEntries.map(\.entry))
+        }
         let anomaly = detectAnomalies
             ? Self.detectAnomaly(previousEntries: previousEntries, currentEntries: indexedEntries)
             : nil
@@ -166,23 +193,23 @@ public actor SnapshotStore {
         return manifest
     }
 
-    public func snapshotSummaries(repositoryID: UUID? = nil, limit: Int = 200) throws -> [SnapshotSummary] {
-        try prepare()
+    public func snapshotSummaries(repositoryID: UUID? = nil, limit: Int = 200) async throws -> [SnapshotSummary] {
+        try await prepare()
         return try metadataStore.summaries(repositoryID: repositoryID, limit: max(1, limit))
     }
 
-    public func snapshotDiff(id: UUID, offset: Int = 0, limit: Int = 500) throws -> SnapshotDiffPage {
-        try prepare()
+    public func snapshotDiff(id: UUID, offset: Int = 0, limit: Int = 500) async throws -> SnapshotDiffPage {
+        try await prepare()
         return try metadataStore.snapshotDiff(snapshotID: id, offset: offset, limit: limit)
     }
 
-    public func snapshotEntries(id: UUID, offset: Int = 0, limit: Int = 500) throws -> SnapshotDiffPage {
-        try prepare()
+    public func snapshotEntries(id: UUID, offset: Int = 0, limit: Int = 500) async throws -> SnapshotDiffPage {
+        try await prepare()
         return try metadataStore.snapshotEntries(snapshotID: id, offset: offset, limit: limit)
     }
 
-    public func manifest(id: UUID) throws -> SnapshotManifest {
-        try prepare()
+    public func manifest(id: UUID) async throws -> SnapshotManifest {
+        try await prepare()
         guard let file = try metadataStore.manifestFile(id: id) else {
             throw DurepoError.corruptManifest(id.uuidString)
         }
@@ -198,10 +225,11 @@ public actor SnapshotStore {
     public func deleteSnapshots(
         repositoryID: UUID,
         mode: SnapshotDeletionMode
-    ) throws -> SnapshotDeletionResult {
-        try prepare()
-        let lockDescriptor = try acquireExclusiveStoreLock()
-        defer { releaseStoreLock(lockDescriptor) }
+    ) async throws -> SnapshotDeletionResult {
+        let lock = try await FileOperationLock.acquire(at: lockURL)
+        defer { lock.release() }
+        try prepareUnlocked()
+        try ensureSafeReferences()
 
         let manifestFiles = try metadataStore.manifestFiles(repositoryID: repositoryID)
         let manifestFileSet = Set(manifestFiles)
@@ -253,8 +281,8 @@ public actor SnapshotStore {
         )
     }
 
-    public func prepareMonitor(repositoryID: UUID, volumeID: String, rootID: String) throws -> RepositoryMonitorState {
-        try prepare()
+    public func prepareMonitor(repositoryID: UUID, volumeID: String, rootID: String) async throws -> RepositoryMonitorState {
+        try await prepare()
         return try metadataStore.prepareMonitor(repositoryID: repositoryID, volumeID: volumeID, rootID: rootID)
     }
 
@@ -264,8 +292,8 @@ public actor SnapshotStore {
         flags: UInt64,
         needsFullScan: Bool,
         changedPaths: [String] = []
-    ) throws {
-        try prepare()
+    ) async throws {
+        try await prepare()
         try metadataStore.recordEvent(
             repositoryID: repositoryID,
             eventID: eventID,
@@ -275,64 +303,66 @@ public actor SnapshotStore {
         )
     }
 
-    public func requireFullScan(repositoryID: UUID) throws {
-        try prepare()
+    public func requireFullScan(repositoryID: UUID) async throws {
+        try await prepare()
         try metadataStore.requireFullScan(repositoryID: repositoryID)
     }
 
-    public func pendingChangeSet(repositoryID: UUID, through eventID: UInt64) throws -> SnapshotChangeSet {
-        try prepare()
+    public func pendingChangeSet(repositoryID: UUID, through eventID: UInt64) async throws -> SnapshotChangeSet {
+        try await prepare()
         return try metadataStore.pendingChangeSet(repositoryID: repositoryID, through: eventID)
     }
 
-    public func monitorState(repositoryID: UUID) throws -> RepositoryMonitorState? {
-        try prepare()
+    public func monitorState(repositoryID: UUID) async throws -> RepositoryMonitorState? {
+        try await prepare()
         return try metadataStore.monitorState(repositoryID: repositoryID)
     }
 
-    public func commitEvents(repositoryID: UUID, through eventID: UInt64) throws -> RepositoryMonitorState {
-        try prepare()
+    public func commitEvents(repositoryID: UUID, through eventID: UInt64) async throws -> RepositoryMonitorState {
+        try await prepare()
         return try metadataStore.commitEvents(repositoryID: repositoryID, through: eventID)
     }
 
     @discardableResult
-    public func recordAgentError(repositoryID: UUID, message: String) throws -> AgentHealth {
-        try prepare()
+    public func recordAgentError(repositoryID: UUID, message: String) async throws -> AgentHealth {
+        try await prepare()
         return try metadataStore.recordAgentError(repositoryID: repositoryID, message: message)
     }
 
-    public func clearAgentError(repositoryID: UUID) throws {
-        try prepare()
+    public func clearAgentError(repositoryID: UUID) async throws {
+        try await prepare()
         try metadataStore.clearAgentError(repositoryID: repositoryID)
     }
 
-    public func agentHealth() throws -> AgentHealth? {
-        try prepare()
+    public func agentHealth() async throws -> AgentHealth? {
+        try await prepare()
         return try metadataStore.agentHealth()
     }
 
-    public func protectionAlerts(includeAcknowledged: Bool = false) throws -> [ProtectionAlert] {
-        try prepare()
+    public func protectionAlerts(includeAcknowledged: Bool = false) async throws -> [ProtectionAlert] {
+        try await prepare()
         return try metadataStore.protectionAlerts(includeAcknowledged: includeAcknowledged)
     }
 
-    public func acknowledgeProtectionAlert(id: UUID) throws {
-        try prepare()
+    public func acknowledgeProtectionAlert(id: UUID) async throws {
+        try await prepare()
         try metadataStore.acknowledgeProtectionAlert(id: id)
     }
 
-    public func setSnapshotProtected(id: UUID, isProtected: Bool) throws {
-        try prepare()
+    public func setSnapshotProtected(id: UUID, isProtected: Bool) async throws {
+        let lock = try await FileOperationLock.acquire(at: lockURL)
+        defer { lock.release() }
+        try prepareUnlocked()
         try metadataStore.setSnapshotProtected(id: id, isProtected: isProtected)
     }
 
-    public func hasRestoreSuppression(repositoryID: UUID) throws -> Bool {
-        try prepare()
+    public func hasRestoreSuppression(repositoryID: UUID) async throws -> Bool {
+        try await prepare()
         return try metadataStore.hasRestoreSuppression(repositoryID: repositoryID)
     }
 
-    public func clearRestoreSuppression(repositoryID: UUID) throws {
-        try prepare()
+    public func clearRestoreSuppression(repositoryID: UUID) async throws {
+        try await prepare()
         try metadataStore.clearRestoreSuppression(repositoryID: repositoryID)
     }
 
@@ -343,35 +373,49 @@ public actor SnapshotStore {
         exclusionRules: ExclusionRuleSet,
         requiresRegisteredRepository: Bool = false
     ) async throws -> InPlaceRestoreResult {
+        let lock = try await FileOperationLock.acquire(at: lockURL)
+        defer { lock.release() }
+        try prepareUnlocked()
         if try hasGitLockFile(in: repositoryURL) {
             throw DurepoError.gitOperationInProgress
         }
-        let targetManifest = try manifest(id: snapshotID)
+        let targetManifest = try await manifest(id: snapshotID)
         guard targetManifest.repositoryID == repositoryID else {
             throw DurepoError.invalidRepository(repositoryURL.path)
         }
         try verify(targetManifest)
         try metadataStore.setSnapshotProtected(id: snapshotID, isProtected: true)
-        let preRestoreSnapshot = try await createSnapshot(
+        let preRestoreSnapshot = try await createSnapshotUnlocked(
             repositoryURL: repositoryURL,
             repositoryID: repositoryID,
             reason: .preRestore,
             exclusionRules: exclusionRules,
             requiresRegisteredRepository: requiresRegisteredRepository
         )
-        let restoredURL = try await SnapshotRestorer(store: self)
-            .replaceExistingDirectory(with: targetManifest, at: repositoryURL)
+        try metadataStore.setSnapshotProtected(id: preRestoreSnapshot.id, isProtected: true)
         try metadataStore.markRestoreCompleted(repositoryID: repositoryID)
+        let replacement: (restoredURL: URL, rollbackURL: URL)
+        do {
+            replacement = try await SnapshotRestorer(store: self)
+                .replaceExistingDirectory(with: targetManifest, at: repositoryURL, exclusionRules: exclusionRules)
+        } catch {
+            try metadataStore.clearRestoreSuppression(repositoryID: repositoryID)
+            throw error
+        }
         try metadataStore.requireFullScan(repositoryID: repositoryID)
-        return InPlaceRestoreResult(restoredURL: restoredURL, preRestoreSnapshot: preRestoreSnapshot)
+        return InPlaceRestoreResult(
+            restoredURL: replacement.restoredURL,
+            preRestoreSnapshot: preRestoreSnapshot,
+            rollbackURL: replacement.rollbackURL
+        )
     }
 
     @discardableResult
     public func recordProtectionAlert(
         repositoryID: UUID,
         anomaly: RepositoryAnomaly
-    ) throws -> ProtectionAlert {
-        try prepare()
+    ) async throws -> ProtectionAlert {
+        try await prepare()
         return try metadataStore.recordProtectionAlert(repositoryID: repositoryID, anomaly: anomaly)
     }
 
@@ -384,7 +428,7 @@ public actor SnapshotStore {
 
     public func verify(entries: [SnapshotEntry]) throws {
         for entry in entries where entry.kind == .file {
-            guard let hash = entry.contentHash else {
+            guard let hash = entry.contentHash, Self.isValidContentHash(hash) else {
                 throw DurepoError.missingObject(entry.relativePath)
             }
             let url = objectURL(for: hash)
@@ -403,10 +447,10 @@ public actor SnapshotStore {
             .appending(path: hash)
     }
 
-    public func checkIntegrity(deep: Bool = true) throws -> StoreIntegrityReport {
-        try prepare()
-        let lockDescriptor = try acquireExclusiveStoreLock()
-        defer { releaseStoreLock(lockDescriptor) }
+    public func checkIntegrity(deep: Bool = true) async throws -> StoreIntegrityReport {
+        let lock = try await FileOperationLock.acquire(at: lockURL)
+        defer { lock.release() }
+        try prepareUnlocked()
 
         var issues: [IntegrityIssue] = []
         let databaseMessages = try metadataStore.integrityMessages(quick: !deep)
@@ -416,11 +460,27 @@ public actor SnapshotStore {
 
         let manifestURLs = try fileManager.contentsOfDirectory(at: manifestsURL, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }
-        let referencedHashes = deep
-            ? try deepIntegrityReferences(manifestURLs: manifestURLs, issues: &issues)
-            : try lightweightIntegrityReferences(manifestURLs: manifestURLs, issues: &issues)
+        var referencedHashes = try lightweightIntegrityReferences(manifestURLs: manifestURLs, issues: &issues)
+        if deep {
+            do {
+                referencedHashes.formUnion(try deepIntegrityReferences(manifestURLs: manifestURLs, issues: &issues))
+            } catch {
+                try metadataStore.setIntegrityFailure(error.localizedDescription)
+                throw error
+            }
+        }
 
         let storedObjects = try storedObjectURLs()
+        if let failure = issues.first(where: { $0.severity == .error }) {
+            try metadataStore.setIntegrityFailure(failure.message)
+        } else if deep {
+            try metadataStore.setIntegrityFailure(nil)
+        } else if let failure = try metadataStore.integrityFailure() {
+            issues.append(IntegrityIssue(
+                severity: .error,
+                message: "A previous integrity failure requires a successful deep check before pruning: \(failure)"
+            ))
+        }
         let orphanCount = storedObjects.lazy.filter { !referencedHashes.contains($0.lastPathComponent) }.count
         if orphanCount > 0 {
             issues.append(IntegrityIssue(
@@ -452,7 +512,7 @@ public actor SnapshotStore {
             issues.append(IntegrityIssue(severity: .error, message: "Missing manifest: \(file)"))
         }
         for file in storedManifestNames.subtracting(indexedManifestNames).sorted() {
-            issues.append(IntegrityIssue(severity: .warning, message: "Unindexed manifest: \(file)"))
+            issues.append(IntegrityIssue(severity: .error, message: "Unindexed manifest: \(file)"))
         }
         if overview.missingContentHashCount > 0 {
             issues.append(IntegrityIssue(
@@ -486,6 +546,10 @@ public actor SnapshotStore {
                 issues.append(IntegrityIssue(severity: .error, message: "Corrupt manifest: \(url.lastPathComponent)"))
                 continue
             }
+            if manifest.formatVersion != DurepoConstants.formatVersion ||
+                url.lastPathComponent != "\(manifest.id.uuidString).json" {
+                issues.append(IntegrityIssue(severity: .error, message: "Invalid manifest identity or format: \(url.lastPathComponent)"))
+            }
             for message in Self.manifestPathIssues(manifest.entries) {
                 issues.append(IntegrityIssue(
                     severity: .error,
@@ -511,18 +575,19 @@ public actor SnapshotStore {
         return referencedHashes
     }
 
-    public func garbageCollect() throws -> GarbageCollectionResult {
-        try prepare()
-        let lockDescriptor = try acquireExclusiveStoreLock()
-        defer { releaseStoreLock(lockDescriptor) }
-        guard try metadataStore.integrityMessages().allSatisfy({ $0.lowercased() == "ok" }),
-              try !metadataStore.hasAnyActiveProtectionAlert() else {
+    public func garbageCollect() async throws -> GarbageCollectionResult {
+        let lock = try await FileOperationLock.acquire(at: lockURL)
+        defer { lock.release() }
+        try prepareUnlocked()
+        try ensureSafeReferences()
+        guard try !metadataStore.hasAnyActiveProtectionAlert() else {
             throw DurepoError.garbageCollectionUnsafe
         }
         return try garbageCollectUnlocked()
     }
 
     private func garbageCollectUnlocked() throws -> GarbageCollectionResult {
+        try ensureSafeReferences()
         let referenced = try referencedContentHashes(excluding: [])
         var deletedCount = 0
         var reclaimedBytes: Int64 = 0
@@ -544,24 +609,39 @@ public actor SnapshotStore {
     private func decodeManifestFile(_ file: String) throws -> SnapshotManifest {
         let url = manifestsURL.appending(path: file)
         do {
-            return try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+            let manifest = try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+            guard manifest.formatVersion == DurepoConstants.formatVersion,
+                  file == "\(manifest.id.uuidString).json",
+                  Self.manifestPathIssues(manifest.entries).isEmpty,
+                  manifest.entries.allSatisfy({ entry in
+                      entry.kind != .file || (entry.contentHash.map(Self.isValidContentHash) == true && entry.byteCount >= 0)
+                  }) else {
+                throw DurepoError.corruptManifest(url.path)
+            }
+            return manifest
         } catch {
             throw DurepoError.corruptManifest(url.path)
         }
     }
 
     private func storedObjectURLs() throws -> [URL] {
+        var enumerationError: Error?
         guard let enumerator = fileManager.enumerator(
             at: objectsURL,
             includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, error in
+                enumerationError = error
+                return false
+            }
+        ) else { throw CocoaError(.fileReadUnknown) }
         var result: [URL] = []
         for case let url as URL in enumerator {
             guard Self.isValidContentHash(url.lastPathComponent),
-                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+                  try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else { continue }
             result.append(url)
         }
+        if let enumerationError { throw enumerationError }
         return result
     }
 
@@ -598,6 +678,7 @@ public actor SnapshotStore {
 
     private func applyCapacityRetention() throws {
         var allocated = try storageAllocatedByteCount()
+        if allocated > maximumStorageByteCount { try ensureSafeReferences() }
         while allocated > maximumStorageByteCount {
             guard let manifestFile = try metadataStore.pruneOldestCapacityCandidate() else { return }
             let manifestURL = manifestsURL.appending(path: manifestFile)
@@ -674,13 +755,29 @@ public actor SnapshotStore {
         var hashes: Set<String> = []
         for url in urls {
             do {
-                let manifest = try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+                let manifest = try decodeManifestFile(url.lastPathComponent)
                 hashes.formUnion(validContentHashes(in: manifest))
             } catch {
                 throw DurepoError.corruptManifest(url.path)
             }
         }
         return hashes
+    }
+
+    private func ensureSafeReferences() throws {
+        guard try metadataStore.integrityFailure() == nil else {
+            throw DurepoError.garbageCollectionUnsafe
+        }
+        let databaseMessages = try metadataStore.integrityMessages(quick: true)
+        guard databaseMessages == ["ok"] else { throw DurepoError.garbageCollectionUnsafe }
+        let urls = try fileManager.contentsOfDirectory(at: manifestsURL, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+        var issues: [IntegrityIssue] = []
+        let indexedHashes = try lightweightIntegrityReferences(manifestURLs: urls, issues: &issues)
+        guard !issues.contains(where: { $0.severity == .error }),
+              try referencedContentHashes(excluding: []) == indexedHashes else {
+            throw DurepoError.garbageCollectionUnsafe
+        }
     }
 
     private func validContentHashes(in manifest: SnapshotManifest) -> Set<String> {
@@ -724,20 +821,15 @@ public actor SnapshotStore {
         return false
     }
 
-    private func acquireExclusiveStoreLock() throws -> Int32 {
-        let descriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
-        guard descriptor >= 0 else { throw Self.posixError() }
-        guard Darwin.lockf(descriptor, F_LOCK, 0) == 0 else {
-            let error = Self.posixError()
-            Darwin.close(descriptor)
+    func acquireReadLease() async throws -> FileOperationLock {
+        let lock = try await FileOperationLock.acquire(at: lockURL)
+        do {
+            try prepareUnlocked()
+            return lock
+        } catch {
+            lock.release()
             throw error
         }
-        return descriptor
-    }
-
-    private func releaseStoreLock(_ descriptor: Int32) {
-        _ = Darwin.lockf(descriptor, F_ULOCK, 0)
-        Darwin.close(descriptor)
     }
 
     private func collectIncrementalChanges(
@@ -805,9 +897,12 @@ public actor SnapshotStore {
 
         for relativePath in ancestors.sorted() where !exclusionRules.excludes(relativePath, isDirectory: true) {
             let url = root.appending(path: relativePath)
-            guard let indexed = try? indexedNonFileEntry(at: url, root: root),
-                  indexed.entry.kind == .directory else { continue }
-            work.entries[relativePath] = indexed
+            do {
+                let indexed = try indexedNonFileEntry(at: url, root: root)
+                if indexed.entry.kind == .directory { work.entries[relativePath] = indexed }
+            } catch let error as POSIXError where error.code == .ENOENT || error.code == .ENOTDIR {
+                continue
+            }
         }
         work.fileCandidates = candidatesByPath.values.sorted { $0.relativePath < $1.relativePath }
         return work
@@ -832,13 +927,14 @@ public actor SnapshotStore {
         }
 
         if let topInfo, topInfo.st_mode & mode_t(S_IFMT) != mode_t(S_IFDIR) { return work }
+        var enumerationError: Error?
         guard let enumerator = fileManager.enumerator(
             at: top,
             includingPropertiesForKeys: nil,
             options: [],
-            errorHandler: { url, error in
-                work.warnings.append("\(url.path): \(error.localizedDescription)")
-                return true
+            errorHandler: { _, error in
+                enumerationError = error
+                return false
             }
         ) else {
             throw DurepoError.invalidRepository(top.path)
@@ -855,6 +951,7 @@ public actor SnapshotStore {
             }
             try collectItem(at: url, root: root, info: info, work: &work)
         }
+        if let enumerationError { throw enumerationError }
         return work
     }
 
@@ -1126,7 +1223,8 @@ public actor SnapshotStore {
         objectsDirectory: URL
     ) throws {
         let destination = objectURL(for: hash, objectsDirectory: objectsDirectory)
-        if FileManager.default.fileExists(atPath: destination.path) { return }
+        if FileManager.default.fileExists(atPath: destination.path),
+           try hashFile(at: destination) == hash { return }
         guard FileManager.default.createFile(atPath: temporaryURL.path, contents: nil) else {
             throw CocoaError(.fileWriteUnknown)
         }
@@ -1147,20 +1245,13 @@ public actor SnapshotStore {
         let fileManager = FileManager.default
         let destination = objectURL(for: hash, objectsDirectory: objectsDirectory)
         try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if fileManager.fileExists(atPath: destination.path) {
+        if fileManager.fileExists(atPath: destination.path),
+           try hashFile(at: destination) == hash {
             try fileManager.removeItem(at: temporaryURL)
             return
         }
         try synchronizeFile(temporaryURL)
-        do {
-            try fileManager.moveItem(at: temporaryURL, to: destination)
-        } catch {
-            if fileManager.fileExists(atPath: destination.path) {
-                try? fileManager.removeItem(at: temporaryURL)
-            } else {
-                throw error
-            }
-        }
+        guard Darwin.rename(temporaryURL.path, destination.path) == 0 else { throw posixError() }
         try synchronizeDirectory(destination.deletingLastPathComponent())
     }
 
@@ -1237,28 +1328,34 @@ public actor SnapshotStore {
     private func reconcileMetadata() throws {
         let urls = try fileManager.contentsOfDirectory(at: manifestsURL, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }
-        for url in urls {
+        let deleted = try metadataStore.deletedManifestFiles()
+        for url in urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            if deleted.contains(url.lastPathComponent) {
+                try fileManager.removeItem(at: url)
+                try Self.synchronizeDirectory(manifestsURL)
+                continue
+            }
             guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent) else { continue }
             do {
-                let manifest = try JSONDecoder.durepo.decode(SnapshotManifest.self, from: Data(contentsOf: url))
+                let manifest = try decodeManifestFile(url.lastPathComponent)
                 if try metadataStore.containsSnapshot(id: id) {
                     if !manifest.entries.isEmpty, try !metadataStore.containsSnapshotEntries(id: id) {
                         try metadataStore.indexEntries(manifest)
                     }
                 } else {
-                    try metadataStore.index(manifest, manifestFile: url.lastPathComponent)
+                    try metadataStore.recoverSnapshot(manifest, manifestFile: url.lastPathComponent)
                     try metadataStore.invalidateCurrentIndex(repositoryID: manifest.repositoryID)
                 }
             } catch {
                 throw DurepoError.corruptManifest(url.path)
             }
         }
-        for repositoryID in try metadataStore.repositoryIDs() {
-            try applyRetention(to: repositoryID)
-        }
     }
 
     private func applyRetention(to repositoryID: UUID) throws {
+        let summaries = try metadataStore.summaries(repositoryID: repositoryID, limit: Int.max)
+        guard summaries.filter({ !$0.isProtected }).count > retentionLimit else { return }
+        try ensureSafeReferences()
         let files = try metadataStore.prune(repositoryID: repositoryID, keeping: retentionLimit)
         for file in files {
             let url = manifestsURL.appending(path: file)

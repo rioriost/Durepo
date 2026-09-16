@@ -19,7 +19,7 @@ Protect the work Git has not yet saved remotely:
 
 Durepo monitors folders you explicitly select and records incremental snapshots after filesystem changes. When a destructive operation is detected, it protects the last healthy snapshot and pauses automatic pruning.
 
-Browse changes or all files in a snapshot, restore selected files and directories to a new location, or perform a confirmed in-place restore. Before an in-place restore, Durepo creates a pre-restore snapshot and uses a rollback-safe replacement process.
+Browse changes or all files in a snapshot, restore selected files and directories to a new location, or perform a confirmed in-place restore. Before an in-place restore, Durepo creates a protected pre-restore snapshot using your exclusion rules. It preserves currently excluded files, atomically exchanges directories, and retains the original directory for manual recovery and cleanup.
 
 APFS clone support makes local capture and restore fast when available. Content-addressed storage deduplicates unchanged data, while integrity diagnostics, capacity-aware retention, and safe garbage collection help keep the snapshot store healthy.
 
@@ -50,7 +50,7 @@ Gitがまだリモートへ保存していない作業を保護します。
 
 Durepoは、利用者が明示的に選択したフォルダを監視し、ファイルシステムの変更後に増分スナップショットを記録します。破壊的な操作を検出すると、直前の正常なスナップショットを保護し、自動削除を一時停止します。
 
-スナップショットの変更点または全ファイルを参照し、選択したファイルやディレクトリを新しい場所へ復元できます。確認操作を伴う元の場所への復元にも対応しています。元の場所へ復元する前にはpre-restoreスナップショットを作成し、失敗時に戻せる安全な置換処理を行います。
+スナップショットの変更点または全ファイルを参照し、選択したファイルやディレクトリを新しい場所へ復元できます。確認操作を伴う元の場所への復元にも対応しています。元の場所へ復元する前には除外設定を適用した保護済みpre-restoreスナップショットを作成します。現在の除外ファイルを保持してディレクトリを原子的に交換し、元のディレクトリも手動で回収・削除できるように残します。
 
 利用可能な環境ではAPFS cloneを使って取得と復元を高速化します。コンテンツアドレス方式で同一データを重複排除し、整合性診断、容量ベースの保持制御、安全なガベージコレクションによってスナップショットストアを管理します。
 

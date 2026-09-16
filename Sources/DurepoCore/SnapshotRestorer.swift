@@ -11,6 +11,12 @@ public actor SnapshotRestorer {
     }
 
     public func restore(_ manifest: SnapshotManifest, to destination: URL) async throws -> URL {
+        let lease = try await store.acquireReadLease()
+        defer { lease.release() }
+        return try await restoreUnlocked(manifest, to: destination)
+    }
+
+    private func restoreUnlocked(_ manifest: SnapshotManifest, to destination: URL) async throws -> URL {
         guard manifest.formatVersion == DurepoConstants.formatVersion else {
             throw DurepoError.unsupportedFormat(manifest.formatVersion)
         }
@@ -84,6 +90,7 @@ public actor SnapshotRestorer {
                 try applyMetadata(entry, to: try targetURL(for: entry.relativePath, under: temporaryURL))
             }
             try fileManager.moveItem(at: temporaryURL, to: finalURL)
+            try SnapshotStore.synchronizeDirectory(parent)
             return finalURL
         } catch {
             try? fileManager.removeItem(at: temporaryURL)
@@ -96,6 +103,9 @@ public actor SnapshotRestorer {
         selecting selectedPaths: Set<String>,
         to destination: URL
     ) async throws -> URL {
+        guard manifest.formatVersion == DurepoConstants.formatVersion else {
+            throw DurepoError.unsupportedFormat(manifest.formatVersion)
+        }
         guard !selectedPaths.isEmpty else { throw DurepoError.emptyRestoreSelection }
         let selectedEntries = try selection(from: manifest.entries, paths: selectedPaths)
         guard !selectedEntries.isEmpty else { throw DurepoError.emptyRestoreSelection }
@@ -110,7 +120,11 @@ public actor SnapshotRestorer {
         return try await restore(filteredManifest, to: destination)
     }
 
-    func replaceExistingDirectory(with manifest: SnapshotManifest, at repositoryURL: URL) async throws -> URL {
+    func replaceExistingDirectory(
+        with manifest: SnapshotManifest,
+        at repositoryURL: URL,
+        exclusionRules: ExclusionRuleSet
+    ) async throws -> (restoredURL: URL, rollbackURL: URL) {
         let target = repositoryURL.standardizedFileURL
         var info = stat()
         guard lstat(target.path, &info) == 0,
@@ -119,28 +133,63 @@ public actor SnapshotRestorer {
         }
 
         let parent = target.deletingLastPathComponent()
-        let staged = parent.appending(path: ".durepo-staged-\(UUID().uuidString)", directoryHint: .isDirectory)
         let rollback = parent.appending(path: ".durepo-rollback-\(UUID().uuidString)", directoryHint: .isDirectory)
-        _ = try await restore(manifest, to: staged)
-
+        _ = try await restoreUnlocked(manifest, to: rollback)
         do {
-            try fileManager.moveItem(at: target, to: rollback)
-            do {
-                try fileManager.moveItem(at: staged, to: target)
-                try SnapshotStore.synchronizeDirectory(parent)
-            } catch {
-                try? fileManager.moveItem(at: rollback, to: target)
-                try? fileManager.removeItem(at: staged)
-                throw error
+            try preserveExcludedItems(from: target, in: rollback, rules: exclusionRules)
+            // A single exchange leaves the repository and its original tree present
+            // even if the process exits between replacement and bookkeeping.
+            guard renameatx_np(AT_FDCWD, target.path, AT_FDCWD, rollback.path, UInt32(RENAME_SWAP)) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
         } catch {
-            try? fileManager.removeItem(at: staged)
+            try? fileManager.removeItem(at: rollback)
             throw error
         }
-
-        try? fileManager.removeItem(at: rollback)
         try SnapshotStore.synchronizeDirectory(parent)
-        return target
+        return (target, rollback)
+    }
+
+    private func preserveExcludedItems(from source: URL, in destination: URL, rules: ExclusionRuleSet) throws {
+        var enumerationError: Error?
+        guard let enumerator = fileManager.enumerator(
+            at: source, includingPropertiesForKeys: nil, options: [],
+            errorHandler: { _, error in
+                enumerationError = error
+                return false
+            }
+        ) else { throw DurepoError.invalidRepository(source.path) }
+        for case let url as URL in enumerator {
+            let info = try url.lstatInfo()
+            let isDirectory = (info.st_mode & S_IFMT) == S_IFDIR
+            let path = try url.safeRelativePath(from: source)
+            guard rules.excludes(path, isDirectory: isDirectory) else { continue }
+            if isDirectory { enumerator.skipDescendants() }
+            let components = try Self.validatedComponents(path)
+            var parent = destination
+            for component in components.dropLast() {
+                parent.append(path: component)
+                var parentInfo = stat()
+                if lstat(parent.path, &parentInfo) == 0 {
+                    guard (parentInfo.st_mode & S_IFMT) == S_IFDIR else {
+                        throw DurepoError.destinationExists(parent.path)
+                    }
+                } else if errno == ENOENT {
+                    try fileManager.createDirectory(at: parent, withIntermediateDirectories: false)
+                } else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
+            let target = try targetURL(for: path, under: destination)
+            var targetInfo = stat()
+            if lstat(target.path, &targetInfo) == 0 {
+                try fileManager.removeItem(at: target)
+            } else if errno != ENOENT {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            try fileManager.copyItem(at: url, to: target)
+        }
+        if let enumerationError { throw enumerationError }
     }
 
     private func selection(from entries: [SnapshotEntry], paths: Set<String>) throws -> [SnapshotEntry] {
@@ -162,14 +211,8 @@ public actor SnapshotRestorer {
     }
 
     private func validate(_ entries: [SnapshotEntry]) throws {
-        let paths = Set(entries.map(\.relativePath))
-        guard paths.count == entries.count else { throw DurepoError.unsafeManifestPath("duplicate path") }
-        let linkPaths = entries.filter { $0.kind == .symbolicLink }.map(\.relativePath)
-        for entry in entries {
-            _ = try Self.validatedComponents(entry.relativePath)
-            if linkPaths.contains(where: { entry.relativePath.hasPrefix($0 + "/") }) {
-                throw DurepoError.unsafeManifestPath(entry.relativePath)
-            }
+        if let issue = SnapshotStore.manifestPathIssues(entries).first {
+            throw DurepoError.unsafeManifestPath(issue)
         }
     }
 
