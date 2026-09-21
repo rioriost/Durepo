@@ -49,7 +49,7 @@ All repository content is processed locally. Backup and restore make no network 
 - Earlier command-line export attempts failed with `No Accounts` and missing distribution signing identities. Xcode Settings nevertheless showed the registered account; those errors did not establish that the GUI was signed out.
 - On 2026-09-21 at 12:21 JST, Xcode Organizer successfully uploaded this archive using Distribute App > App Store Connect. Xcode displayed `Durepo 1.1.2 (8) uploaded` and `Uploaded to Apple`.
 - App Store Connect independently confirmed processing completed. Exactly version 1.1.2, build 8 was selected, saved, and reverified in the release draft.
-- At 12:30 JST, Add for Review passed; the submission draft contains only macOS 1.1.2 (8) and has an enabled Submit for Review button. Final submission is pending confirmation of the preflight limitations.
+- At 12:30 JST, Add for Review passed; the submission draft contains only macOS 1.1.2 (8) and has an enabled Submit for Review button. After the user confirmed the disclosed preflight limitations, final submission succeeded at 12:32 JST. The submission detail page shows **Waiting for Review / 審査待ち** for 1.1.2 (8).
 - App Store Connect draft 1.1.2 exists in **Prepare for Submission / 提出準備中**. English/Japanese release notes and promotional text, plus review notes, were saved. The release method remains the inherited automatic-after-approval setting.
 - Existing 1.1.1 (7) was verified **Ready for Distribution / 配信準備完了** on 2026-09-21.
 
@@ -75,4 +75,6 @@ xcodebuild -exportArchive \
   -allowProvisioningUpdates
 ```
 
-Processing and build selection are complete. The user requested submission after checking required items. The [preflight report](app-store-preflight-1.1.2.md) records two warnings (old GUI screenshots and EU/DSA restriction) and two manual items (runtime coverage and content rights). Review contacts were confirmed in the actual rendered page; contracts are Active. Add for Review passed. Final Submit for Review has not been clicked; the skill's final confirmation gate remains pending. Existing automatic release after approval is retained.
+Processing and build selection are complete. The user requested submission after checking required items. The [preflight report](app-store-preflight-1.1.2.md) records two warnings (old GUI screenshots and EU/DSA restriction) and two manual items (runtime coverage and content rights). Review contacts were confirmed in the actual rendered page; contracts are Active. Add for Review passed. The user gave final confirmation and Submit for Review succeeded on 2026-09-21 at 12:32 JST. Submission ID: `c7ca5c17-aa46-4ae5-86be-f86a406ffe34`; verified status: **Waiting for Review / 審査待ち**. This is not approval or publication. Existing automatic release after approval is retained.
+
+Submission evidence: [App Store Connect submission detail](https://appstoreconnect.apple.com/apps/6791964607/distribution/reviewsubmissions/details/c7ca5c17-aa46-4ae5-86be-f86a406ffe34).

@@ -4,7 +4,8 @@
 - Version / build: 1.1.2 / 8
 - Submission type: update
 - Guidelines checked: [Apple App Review Guidelines](https://developer.apple.com/app-store/review/guidelines/), displayed update June 8, 2026; retrieved again 2026-09-21
-- Readiness: **READY WITH MANUAL CONFIRMATIONS** (technical submission validation passed; runtime and screenshot limitations remain)
+- Preflight readiness: **READY WITH MANUAL CONFIRMATIONS** (technical submission validation passed; runtime and screenshot limitations remain)
+- Final outcome: user confirmed submission with those limitations; **Waiting for Review / 審査待ち**, verified 2026-09-21 at 12:32 JST.
 - Counts: **BLOCKER 0 / WARNING 2 / MANUAL 2 / PASS 8 / NOT APPLICABLE 6** (finding groups listed below)
 
 ## Actionable findings
@@ -83,4 +84,4 @@ App Information also shows Developer Tools as primary category, Utilities as sec
 
 W1 (old screenshots), W2 (EU/DSA), M1 (runtime coverage), and M3 (rights) remain open. The selected build identity matches the inspected local archive and Apple completed upload processing. Submission validation does not establish App Review approval or complete runtime qualification.
 
-**No final submission action was performed.** Add for Review was performed at the user's request; the final Submit for Review button is pending confirmation under the app-store-review-preflight skill. The inherited release mode is automatic after approval. No contract acceptance, certificate revocation, price change or distribution-region change was performed.
+**Final submission performed after explicit user confirmation.** App Store Connect confirmed one item submitted; the submission detail page shows macOS 1.1.2 (8), Waiting for Review, submitted 2026-09-21 at 12:32 JST. Submission ID: `c7ca5c17-aa46-4ae5-86be-f86a406ffe34`. Submission does not establish approval or publication, and the disclosed preflight limitations remain recorded above. The inherited release mode is automatic after approval. No contract acceptance, certificate revocation, price change or distribution-region change was performed.
