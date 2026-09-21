@@ -15,7 +15,21 @@ struct ContentView: View {
                 Label("Snapshots", systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90")
                     .tag(AppSection.snapshots)
             }
-            .navigationTitle("Durepo")
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 260)
+            .safeAreaInset(edge: .bottom) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Background protection", systemImage: model.isAgentEnabled ? "shield.lefthalf.filled" : "pause.circle")
+                        .font(.caption.weight(.medium))
+                    Text(model.isAgentEnabled ? "Enabled" : model.agentStatus == .requiresApproval ? "Approval Required" : "Disabled")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    SettingsLink { Text("Settings…") }
+                        .font(.caption)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+            }
         } detail: {
             switch model.selection ?? .dashboard {
             case .dashboard:
@@ -26,23 +40,39 @@ struct ContentView: View {
                 SnapshotsView(model: model)
             }
         }
-        .toolbar {
-            ToolbarItemGroup {
-                if model.isBusy {
-                    ProgressView()
-                        .controlSize(.small)
+        .navigationTitle(sectionTitle)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if model.isBusy {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
                     Text(model.progressDescription)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .frame(maxWidth: 260)
+                        .font(.callout)
+                        .lineLimit(2)
+                    Spacer()
                 }
+                .padding(12)
+                .background(.bar)
+                .accessibilityElement(children: .combine)
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task { await model.addRepository() }
                 } label: {
-                    Label("Add Repository", systemImage: "plus")
+                    Label("Add Repository", systemImage: "folder.badge.plus")
                 }
+                .help("Add Repository")
                 .disabled(model.isBusy)
             }
+        }
+    }
+
+    private var sectionTitle: LocalizedStringKey {
+        switch model.selection ?? .dashboard {
+        case .dashboard: "Dashboard"
+        case .repositories: "Repositories"
+        case .snapshots: "Snapshots"
         }
     }
 }
@@ -53,8 +83,12 @@ private struct DashboardView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                Text("Dashboard")
-                    .font(.largeTitle.bold())
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Repository Protection")
+                        .font(.title2.bold())
+                    Text("Keep recovery points for your Git metadata and uncommitted work.")
+                        .foregroundStyle(.secondary)
+                }
 
                 ForEach(model.protectionAlerts) { alert in
                     GroupBox {
@@ -82,17 +116,28 @@ private struct DashboardView: View {
                 }
 
                 HStack(spacing: 16) {
-                    MetricCard(title: "Protected repositories", value: "\(model.repositories.count)", symbol: "folder.badge.gearshape")
+                    MetricCard(title: "Repositories", value: "\(model.repositories.count)", symbol: "folder.badge.gearshape")
                     MetricCard(title: "Snapshots", value: "\(model.snapshots.count)", symbol: "clock.arrow.circlepath")
                 }
 
                 GroupBox("Recent snapshots") {
                     if model.snapshots.isEmpty {
-                        ContentUnavailableView(
-                            "No snapshots yet",
-                            systemImage: "clock.badge.questionmark",
-                            description: Text("Add a repository to create its first snapshot.")
-                        )
+                        ContentUnavailableView {
+                            Label("No snapshots yet", systemImage: "clock.badge.questionmark")
+                        } description: {
+                            Text(model.repositories.isEmpty
+                                 ? "Add a repository to create its first snapshot."
+                                 : "Create a snapshot to save a recovery point.")
+                        } actions: {
+                            if model.repositories.isEmpty {
+                                Button("Add Repository") { Task { await model.addRepository() } }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(model.isBusy)
+                            } else {
+                                Button("Snapshot All Now") { Task { await model.createSnapshotsForAllRepositories() } }
+                                    .disabled(model.isBusy)
+                            }
+                        }
                     } else {
                         SnapshotTable(model: model, snapshots: Array(model.snapshots.prefix(8)))
                             .frame(minHeight: 220)
@@ -134,7 +179,10 @@ private struct RepositoriesView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Repositories").font(.largeTitle.bold())
+            Text("Choose a repository to manage its recovery points and exclusion rules.")
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
             if model.repositories.isEmpty {
                 ContentUnavailableView {
                     Label("No protected repositories", systemImage: "externaldrive.badge.plus")
@@ -148,60 +196,74 @@ private struct RepositoriesView: View {
             } else {
                 List(selection: $model.selectedRepositoryID) {
                     ForEach(model.repositories) { repository in
-                        HStack {
+                        HStack(alignment: .top, spacing: 12) {
                             Image(systemName: "folder.fill")
+                                .font(.title2)
                                 .foregroundStyle(.tint)
-                            VStack(alignment: .leading) {
-                                Text(repository.displayName).font(.headline)
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(repository.displayName)
+                                    .font(.headline)
+                                    .lineLimit(2)
+                                    .help(repository.displayName)
                                 Text(repository.customExclusionRules == nil
                                      ? String(localized: "Uses Default Rules")
                                      : String(localized: "Independent Exclusion Rules"))
-                                    .font(.caption)
+                                    .font(.callout)
                                     .foregroundStyle(.secondary)
                                 if let message = model.repositoryAccessErrors[repository.id] {
                                     Label(message, systemImage: "exclamationmark.triangle")
-                                        .font(.caption)
-                                        .foregroundStyle(.orange)
+                                        .font(.callout)
                                 } else if !repository.isEnabled {
-                                    Text("Background protection is paused. Reconnect the repository folder.")
+                                    Label("Background protection is paused. Reconnect the repository folder.", systemImage: "pause.circle")
+                                        .font(.callout)
+                                }
+                                HStack {
+                                    if model.repositoryAccessErrors[repository.id] != nil || !repository.isEnabled {
+                                        Button("Reconnect Folder…") {
+                                            Task { await model.reconnectRepository(repository) }
+                                        }
+                                        .disabled(model.isBusy)
+                                    } else {
+                                        Button("Snapshot Now") {
+                                            Task { await model.createSnapshot(of: repository) }
+                                        }
+                                        .disabled(model.isBusy)
+                                    }
+                                    Spacer()
+                                    Text(repository.addedAt, format: .dateTime.year().month().day())
                                         .font(.caption)
-                                        .foregroundStyle(.orange)
+                                        .foregroundStyle(.secondary)
+                                        .help("Added")
                                 }
-                                Text(repository.addedAt, format: .dateTime.year().month().day().hour().minute())
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
                             }
-                            Spacer()
-                            if model.repositoryAccessErrors[repository.id] != nil || !repository.isEnabled {
-                                Button("Reconnect Folder…") {
-                                    Task { await model.reconnectRepository(repository) }
+                            Menu {
+                                Button("Edit Exclusion Rules") { repositoryEditingExclusions = repository }
+                                Button("Show Snapshots") {
+                                    model.selectedRepositoryID = repository.id
+                                    model.selection = .snapshots
                                 }
-                                .disabled(model.isBusy)
-                            }
-                            Button("Edit Exclusion Rules") {
-                                repositoryEditingExclusions = repository
-                            }
-                            .disabled(model.isBusy)
-                            Button("Snapshot Now") {
-                                Task { await model.createSnapshot(of: repository) }
-                            }
-                            .disabled(model.isBusy || !repository.isEnabled)
-                            Button(role: .destructive) {
-                                repositoryPendingDeletion = repository
+                                Divider()
+                                Button("Remove Repository…", role: .destructive) { repositoryPendingDeletion = repository }
                             } label: {
-                                Image(systemName: "trash")
+                                Label("Repository Actions", systemImage: "ellipsis")
                             }
-                            .help("Remove Repository…")
-                            .buttonStyle(.borderless)
+                            .menuStyle(.borderlessButton)
+                            .labelStyle(.iconOnly)
+                            .menuIndicator(.hidden)
+                            .fixedSize()
+                            .help("Repository Actions")
+                            .accessibilityLabel(Text("Repository Actions"))
+                            .accessibilityValue(repository.displayName)
                             .disabled(model.isBusy)
                         }
-                        .padding(.vertical, 5)
+                        .padding(.vertical, 10)
                         .tag(repository.id)
                     }
                 }
             }
         }
-        .padding(24)
+
         .sheet(item: $repositoryPendingDeletion) { repository in
             RepositoryDeletionDialog(
                 repository: repository,
@@ -415,7 +477,7 @@ private struct ExclusionRuleListEditor: View {
     @State private var selection: Int?
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             List(selection: $selection) {
                 ForEach(rules.indices, id: \.self) { index in
                     TextField("Exclusion rule", text: ruleBinding(at: index))
@@ -425,25 +487,22 @@ private struct ExclusionRuleListEditor: View {
             }
             .border(.separator)
 
-            VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
                 Button("Add") {
                     rules.append("")
                     selection = rules.indices.last
                 }
-                .frame(maxWidth: .infinity)
 
                 Button("Delete") {
                     guard let selection, rules.indices.contains(selection) else { return }
                     rules.remove(at: selection)
                     self.selection = rules.indices.contains(selection) ? selection : rules.indices.last
                 }
-                .frame(maxWidth: .infinity)
-                .disabled(selection == nil)
+                .disabled(selection == nil || !rules.indices.contains(selection ?? -1))
 
+                Spacer()
                 if let optimize {
                     Button("Optimize for Repository", action: optimize)
-                        .padding(.top, 8)
-                        .frame(maxWidth: .infinity)
                         .disabled(isOptimizing)
                     if isOptimizing {
                         ProgressView()
@@ -452,7 +511,6 @@ private struct ExclusionRuleListEditor: View {
                     }
                 }
             }
-            .frame(width: 170)
         }
     }
 
@@ -512,23 +570,38 @@ private struct SnapshotsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text("Snapshots").font(.largeTitle.bold())
-                Spacer()
                 Picker("Repository", selection: $model.selectedRepositoryID) {
                     Text("All Repositories").tag(UUID?.none)
                     ForEach(model.repositories) { repository in
                         Text(repository.displayName).tag(Optional(repository.id))
                     }
                 }
-                .frame(width: 240)
+                .frame(maxWidth: 360)
+                Spacer()
             }
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
             if model.selectedSnapshots.isEmpty {
-                ContentUnavailableView("No snapshots", systemImage: "clock.badge.questionmark")
+                ContentUnavailableView {
+                    Label("No snapshots", systemImage: "clock.badge.questionmark")
+                } description: {
+                    Text("Create a snapshot to save a recovery point.")
+                } actions: {
+                    if let repository = model.selectedRepository {
+                        Button("Snapshot Now") { Task { await model.createSnapshot(of: repository) } }
+                            .disabled(model.isBusy || !repository.isEnabled)
+                    } else if !model.repositories.isEmpty {
+                        Button("Snapshot All Now") { Task { await model.createSnapshotsForAllRepositories() } }
+                            .disabled(model.isBusy)
+                    } else {
+                        Button("Add Repository") { Task { await model.addRepository() } }
+                            .disabled(model.isBusy)
+                    }
+                }
             } else {
                 SnapshotTable(model: model, snapshots: model.selectedSnapshots)
             }
         }
-        .padding(24)
     }
 }
 
@@ -540,57 +613,76 @@ private struct SnapshotTable: View {
 
     var body: some View {
         Table(snapshots) {
-            TableColumn("Repository") { snapshot in Text(snapshot.repositoryName) }
-            TableColumn("Created") { snapshot in
-                Text(snapshot.createdAt, format: .dateTime.year().month().day().hour().minute().second())
-            }
-            TableColumn("Reason") { snapshot in Text(snapshot.reason.localizedTitle) }
-            TableColumn("Files") { snapshot in Text("\(snapshot.fileCount)") }
-            TableColumn("Size") { snapshot in
-                Text(ByteCountFormatter.string(fromByteCount: snapshot.logicalByteCount, countStyle: .file))
-            }
-            TableColumn("Status") { snapshot in
-                HStack(spacing: 5) {
-                    if snapshot.isProtected {
-                        Image(systemName: "shield.fill")
-                            .foregroundStyle(.green)
-                            .help("Protected from retention")
-                    }
+            TableColumn("Repository") { snapshot in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(snapshot.repositoryName)
+                        .lineLimit(1)
+                        .help(snapshot.repositoryName)
                     if snapshot.healthState == .anomalous {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                            .help("Destructive change detected")
+                        Label("Destructive change detected", systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                    }
+                    if snapshot.isProtected {
+                        Label("Protected from retention", systemImage: "shield.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
+                .padding(.vertical, 5)
             }
-            .width(70)
-            TableColumn("") { snapshot in
-                HStack {
-                    Button {
-                        Task { await model.setSnapshotProtected(snapshot, isProtected: !snapshot.isProtected) }
-                    } label: {
-                        Image(systemName: snapshot.isProtected ? "shield.slash" : "shield")
+            .width(min: 140, ideal: 180)
+            TableColumn("Created") { snapshot in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(snapshot.createdAt, format: .dateTime.year().month().day())
+                    HStack(spacing: 6) {
+                        Text(snapshot.createdAt, format: .dateTime.hour().minute().second())
+                        Text(snapshot.reason.localizedTitle)
                     }
-                    .help(snapshot.isProtected ? "Remove Protection" : "Protect Snapshot")
-                    .disabled(model.isBusy)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .width(min: 140, ideal: 160)
+            TableColumn("Contents") { snapshot in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(snapshot.fileCount) files")
+                    Text(ByteCountFormatter.string(fromByteCount: snapshot.logicalByteCount, countStyle: .file))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .monospacedDigit()
+            }
+            .width(min: 90, ideal: 100)
+            TableColumn("Actions") { snapshot in
+                HStack(spacing: 10) {
                     Button { snapshotShowingChanges = snapshot } label: {
-                        Image(systemName: "list.bullet.rectangle")
+                        Label("Changes…", systemImage: "list.bullet.rectangle")
                     }
-                        .help("Changes…")
-                        .disabled(model.isBusy)
+                    .labelStyle(.iconOnly)
+                    .help("Changes…")
                     Menu {
+                        Button(snapshot.isProtected ? "Remove Protection" : "Protect Snapshot") {
+                            Task { await model.setSnapshotProtected(snapshot, isProtected: !snapshot.isProtected) }
+                        }
+                        Divider()
                         Button("Restore…") { Task { await model.restore(snapshot) } }
                         Button("Restore in Place…") { snapshotRestoringInPlace = snapshot }
                             .disabled(!model.repositories.contains { $0.id == snapshot.repositoryID })
                     } label: {
-                        Image(systemName: "arrow.counterclockwise")
+                        Label("Snapshot Actions", systemImage: "ellipsis")
                     }
-                    .help("Restore…")
-                        .disabled(model.isBusy)
+                    .menuStyle(.borderlessButton)
+                    .labelStyle(.iconOnly)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Snapshot Actions")
+                    .accessibilityLabel(Text("Snapshot Actions"))
                 }
+                .disabled(model.isBusy)
             }
-            .width(125)
+            .width(85)
         }
+
         .sheet(item: $snapshotShowingChanges) { snapshot in
             SnapshotChangesDialog(
                 model: model,
@@ -693,7 +785,7 @@ private struct SnapshotChangesDialog: View {
 
             List(entries) { entry in
                 HStack(spacing: 10) {
-                    Toggle("", isOn: selectionBinding(for: entry))
+                    Toggle(entry.relativePath, isOn: selectionBinding(for: entry))
                         .labelsHidden()
                         .disabled(entry.kind == .removed)
                     Image(systemName: entry.entryKind == .directory ? "folder" : entry.entryKind == .symbolicLink ? "link" : "doc")
@@ -805,93 +897,114 @@ struct SettingsView: View {
     @Bindable var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Toggle(
-                "Background protection",
-                isOn: Binding(
+        TabView {
+            generalSettings
+                .tabItem { Label("General", systemImage: "gearshape") }
+            exclusionSettings
+                .tabItem { Label("Exclusion Rules", systemImage: "line.3.horizontal.decrease") }
+            diagnosticsSettings
+                .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
+        }
+        .frame(minWidth: 520, minHeight: 440)
+        .navigationTitle("Durepo Settings")
+    }
+
+    private var generalSettings: some View {
+        Form {
+            Section {
+                Toggle("Background protection", isOn: Binding(
                     get: { model.isAgentEnabled },
                     set: { model.setAgentEnabled($0) }
-                )
-            )
-            .toggleStyle(.switch)
-            .disabled(model.isBusy)
-
-            if model.agentStatus == .requiresApproval {
-                Text("Allow Durepo in System Settings > General > Login Items.")
-                    .font(.caption)
-                Button("Login Item Settings") { SMAppService.openSystemSettingsLoginItems() }
-            } else if model.agentStatus == .notFound {
-                Text("The embedded background agent could not be found.")
-                    .foregroundStyle(.orange)
-            }
-
-            Toggle(
-                "Launch at Login",
-                isOn: Binding(
+                ))
+                .disabled(model.isBusy)
+                Text("The background agent only accesses folders you explicitly choose.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                if model.agentStatus == .requiresApproval {
+                    Label("Allow Durepo in System Settings > General > Login Items.", systemImage: "exclamationmark.circle")
+                    Button("Login Item Settings") { SMAppService.openSystemSettingsLoginItems() }
+                } else if model.agentStatus == .notFound {
+                    Label("The embedded background agent could not be found.", systemImage: "exclamationmark.triangle")
+                }
+                Toggle("Launch at Login", isOn: Binding(
                     get: { model.launchesAtLogin },
                     set: { model.setLaunchesAtLogin($0) }
-                )
-            )
-            .toggleStyle(.checkbox)
-            .accessibilityLabel(Text("Launch at Login"))
-            .disabled(model.isBusy)
-
-            Divider()
-
-            HStack {
-                Text("Storage:")
-                TextField("", text: .constant(model.storagePath))
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(true)
-            }
-
-            Divider()
-
-            Text("Default Exclusion Rules")
-                .font(.headline)
-            Text("Uses .gitignore syntax. Repositories use these defaults unless independent rules are saved or automatically suggested. Use Default Rules in the repository editor to resume inheritance.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            ExclusionRuleListEditor(
-                rules: Binding(
-                    get: { model.globalExclusionRules },
-                    set: { model.updateGlobalExclusionRules($0) }
-                )
-            )
-            .frame(height: 180)
-            .padding(.bottom, 16)
-            .disabled(model.isBusy)
-
-            Divider()
-
-            Text("Diagnostics")
-                .font(.headline)
-            if let report = model.integrityReport {
-                Label(
-                    report.isHealthy ? "Storage is healthy" : "Storage needs attention",
-                    systemImage: report.isHealthy ? "checkmark.shield.fill" : "exclamationmark.shield.fill"
-                )
-                .foregroundStyle(report.isHealthy ? .green : .red)
-                Text(String(
-                    format: String(localized: "%lld snapshots • %lld objects • %lld reclaimable"),
-                    Int64(report.snapshotCount),
-                    Int64(report.storedObjectCount),
-                    Int64(report.orphanObjectCount)
                 ))
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .disabled(model.isBusy)
+            } header: {
+                Text("General")
             }
-            HStack {
+            Section("Storage") {
+                Text(model.storagePath)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Section("Privacy") {
+                Text("Durepo processes repository data locally and does not transmit file contents.")
+                    .foregroundStyle(.secondary)
+                Link("Privacy Policy", destination: URL(string: "https://github.com/rioriost/Durepo/blob/main/PRIVACY.md")!)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var exclusionSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Default Exclusion Rules").font(.headline)
+            Text("Uses .gitignore syntax. Repositories use these defaults unless independent rules are saved or automatically suggested. Use Default Rules in the repository editor to resume inheritance.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ExclusionRuleListEditor(rules: Binding(
+                get: { model.globalExclusionRules },
+                set: { model.updateGlobalExclusionRules($0) }
+            ))
+            .disabled(model.isBusy)
+        }
+        .padding(20)
+    }
+
+    private var diagnosticsSettings: some View {
+        Form {
+            Section("Diagnostics") {
+                if let report = model.integrityReport {
+                    Label(
+                        report.isHealthy ? "Storage is healthy" : "Storage needs attention",
+                        systemImage: report.isHealthy ? "checkmark.shield" : "exclamationmark.shield"
+                    )
+                    Text(String(
+                        format: String(localized: "%lld snapshots • %lld objects • %lld reclaimable"),
+                        Int64(report.snapshotCount), Int64(report.storedObjectCount), Int64(report.orphanObjectCount)
+                    ))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                } else {
+                    Text("Check snapshot storage for missing or damaged data.")
+                        .foregroundStyle(.secondary)
+                }
                 Button("Run Integrity Check") { Task { await model.runIntegrityCheck() } }
-                Button("Reclaim Data") { Task { await model.garbageCollect() } }
-                    .disabled(model.integrityReport?.orphanObjectCount == 0)
                 Button("Export…") { model.exportDiagnostics() }
                     .disabled(model.integrityReport == nil)
             }
-            .disabled(model.isBusy)
+            Section("Storage Maintenance") {
+                Text("Reclaim stored file data that is no longer used by any snapshot.")
+                    .foregroundStyle(.secondary)
+                Button("Reclaim Data") { Task { await model.garbageCollect() } }
+                    .disabled(model.integrityReport?.orphanObjectCount == 0)
+            }
         }
-        .frame(minHeight: 500)
-        .navigationTitle("Durepo Settings")
+        .formStyle(.grouped)
+        .disabled(model.isBusy)
+        .safeAreaInset(edge: .bottom) {
+            if model.isBusy {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(model.progressDescription).font(.callout)
+                }
+                .padding()
+            }
+        }
     }
 }
 

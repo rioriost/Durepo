@@ -29,11 +29,32 @@ struct DurepoApp: App {
                 }
         }
         .defaultSize(width: 980, height: 680)
+        .commands {
+            CommandGroup(after: .newItem) {
+                Button("Add Repository…") { Task { await model.addRepository() } }
+                    .keyboardShortcut("o", modifiers: [.command])
+                    .disabled(model.isBusy)
+                Button("Snapshot All Now") { Task { await model.createSnapshotsForAllRepositories() } }
+                    .keyboardShortcut("s", modifiers: [.command, .shift])
+                    .disabled(model.isBusy || model.repositories.isEmpty)
+            }
+            CommandGroup(replacing: .help) {
+                Link("Durepo Support", destination: URL(string: "https://github.com/rioriost/Durepo/issues")!)
+                Link("Privacy Policy", destination: URL(string: "https://github.com/rioriost/Durepo/blob/main/PRIVACY.md")!)
+            }
+            CommandGroup(after: .sidebar) {
+                Button("Dashboard") { model.selection = .dashboard }
+                    .keyboardShortcut("1", modifiers: .command)
+                Button("Repositories") { model.selection = .repositories }
+                    .keyboardShortcut("2", modifiers: .command)
+                Button("Snapshots") { model.selection = .snapshots }
+                    .keyboardShortcut("3", modifiers: .command)
+            }
+        }
 
         Settings {
             SettingsView(model: model)
-                .frame(width: 460)
-                .padding(20)
+                .frame(width: 560, height: 480)
         }
 
 
