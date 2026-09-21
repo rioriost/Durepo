@@ -2,7 +2,7 @@
 
 Durepo is a macOS repository snapshot and recovery utility for protecting Git metadata, uncommitted changes, and untracked files from accidental destructive operations.
 
-The `1.1.1` implementation covers the reviewed MVP 1, MVP 2, and local-recovery portions of the Version 1.0 scope. It is designed for recovery from accidental local damage, not as a tamper-proof or offline backup. It includes:
+The `1.1.2` implementation covers the reviewed MVP 1, MVP 2, and local-recovery portions of the Version 1.0 scope. It is designed for recovery from accidental local damage, not as a tamper-proof or offline backup. It includes:
 
 - a SwiftUI dashboard with English and Japanese localization;
 - user-selected repository access through security-scoped bookmarks;
@@ -19,6 +19,8 @@ The `1.1.1` implementation covers the reviewed MVP 1, MVP 2, and local-recovery 
 - local, ecosystem-aware exclusion suggestions selected from manifest and tool configuration evidence, with Git-tracked-path protection and confidence reporting;
 - App Sandbox, App Group, Hardened Runtime, App Store export, and Developer ID notarization configuration.
 - privacy manifests declaring the required reasons for file metadata, elapsed-time, and disk-space APIs.
+
+Version `1.1.2` reorganizes the repository and snapshot interfaces, adds settings tabs and keyboard shortcuts, and makes privacy and support links available inside the app. [Release preparation](docs/release-1.1.2.md) records the App Store signing blocker and remaining validation.
 
 See [the reviewed implementation plan](docs/plan.md), [the multi-angle review](docs/plan-review.md), [the 1.0 quality review](docs/quality-review-1.0.md), and [the release checklist](docs/release-checklist.md) for the threat model and release gates.
 
@@ -73,5 +75,7 @@ Durepoは、誤操作による大量削除などから、`.git`、未コミッ�
 `1.1.1`では保存・削除・復元の排他、読み取り失敗時の保護、障害後の回復、監視の再開、設定と画面状態の整合性を修正しました。[レビューと修正記録](docs/astra-review-2026-09-16.md)を参照してください。
 
 元位置復元では除外対象の現在データも保持し、交換前のディレクトリを隣接する `.durepo-rollback-…` に残します。復元前snapshotには通常の除外設定が適用されます。退避ディレクトリは保持数・容量制御の対象外で、自動削除されません。復元結果を確認した後、アプリが示す退避先を必要に応じて手動で削除してください。
+
+`1.1.2`では一覧と設定画面を整理し、キーボードショートカットとプライバシー・サポートへの導線を追加しました。[リリース準備記録](docs/release-1.1.2.md)に配布署名の阻害要因と未確認項目を記載しています。
 
 macOSの優先言語が日本語の場合は日本語、それ以外は英語で表示します。問題の報告とサポートは[GitHub Issues](https://github.com/rioriost/Durepo/issues)を利用してください。

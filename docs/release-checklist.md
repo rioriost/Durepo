@@ -1,6 +1,8 @@
-# Durepo 1.1.1 Release Checklist
+# Durepo 1.1.2 Release Checklist
 
-Release candidate date: 2026-09-16
+Release candidate date: 2026-09-21
+
+Current preparation and signing status: [1.1.2 (8)](release-1.1.2.md).
 
 ## Automated gates
 
@@ -14,10 +16,10 @@ Release candidate date: 2026-09-16
 
 ## App Store Connect values
 
-- Version: `1.1.1`
-- Build: `7`
+- Version: `1.1.2`
+- Build: `8`
 - Bundle ID: `st.rio.Durepo` (the exact identifier automatically registered by Xcode)
-- Category: Utilities
+- App Store categories: Developer Tools (primary), Utilities (secondary); app bundle category: Utilities
 - Support URL: <https://github.com/rioriost/Durepo/issues>
 - Privacy policy URL: <https://github.com/rioriost/Durepo/blob/main/PRIVACY.md>
 - License: MIT
@@ -25,7 +27,7 @@ Release candidate date: 2026-09-16
 
 ## Manual release operations
 
-- The GitHub source release does not imply that build 7 has been submitted to or accepted by the Mac App Store.
+- The GitHub source release does not imply that build 8 has been submitted to or accepted by the Mac App Store.
 - Confirm App Group `23889H77KX.st.rio.Durepo` and provisioning profiles in the Apple Developer portal.
 - Run a signed Release archive and inspect Xcode's Privacy Report.
 - Install the archived app in `/Applications`, enable background protection, reboot a physical Mac, and confirm monitoring resumes.
