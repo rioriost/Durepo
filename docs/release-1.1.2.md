@@ -46,18 +46,19 @@ All repository content is processed locally. Backup and restore make no network 
 - `codesign --verify --deep --strict` passed for the archived app. Separate helper verification passed. App and helper retain App Sandbox and the existing App Group.
 - The archive contains `Contents/Resources/DurepoAgent`, the LaunchAgent plist, both localizations, and app/framework privacy manifests.
 - Signing identity on the archive is **Apple Development**, not App Store distribution signing. Archive success is not export success.
-- App Store export failed with `No Accounts`, `No signing certificate "Mac Installer Distribution" found`, and `No signing certificate "Mac App Distribution" found`.
-- No package was uploaded; build processing and selection have not occurred.
+- Earlier command-line export attempts failed with `No Accounts` and missing distribution signing identities. Xcode Settings nevertheless showed the registered account; those errors did not establish that the GUI was signed out.
+- On 2026-09-21 at 12:21 JST, Xcode Organizer successfully uploaded this archive using Distribute App > App Store Connect. Xcode displayed `Durepo 1.1.2 (8) uploaded` and `Uploaded to Apple`.
+- App Store Connect independently shows version 1.1.2, build 8, received at 12:21 and **Processing / 処理中**. Processing completion and release-build selection remain unverified.
 - App Store Connect draft 1.1.2 exists in **Prepare for Submission / 提出準備中**. English/Japanese release notes and promotional text, plus review notes, were saved. The release method remains the inherited automatic-after-approval setting.
 - Existing 1.1.1 (7) was verified **Ready for Distribution / 配信準備完了** on 2026-09-21.
 
 Local logs: `build/release-1.1.2/archive.log`, `export.log`, `preflight-archive.json`. These are ignored build artifacts and are not committed.
 
-## Resume export and upload
+## Upload route and remaining steps
 
-Restore the team account in Xcode Settings > Accounts and make valid Mac App Distribution and Mac Installer Distribution signing identities available, or use the team's authorized cloud signing workflow. Do not revoke or recreate unrelated certificates.
+The Xcode Organizer route succeeded without removing/re-adding the account or manually changing certificates. The cause of the earlier command-line/GUI discrepancy was not established. Do not repeat the upload of build 8 or revoke unrelated certificates.
 
-After the signing environment is available:
+The following command-line commands are retained for reference; they were not the successful upload route:
 
 ```sh
 xcodebuild -exportArchive \

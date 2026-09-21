@@ -9,11 +9,11 @@
 
 ## Actionable findings
 
-### B1 — BLOCKER: App Store export and build association are incomplete
+### B1 — BLOCKER: Build processing and release association are incomplete
 
-The signed Release archive succeeds, but App Store export exits 70 with `No Accounts` and missing `Mac App Distribution` / `Mac Installer Distribution` signing identities. The available archive is development-signed. Draft 1.1.2 has no uploaded/selected build. Restore the Xcode account/signing setup, export/upload, wait for processing, and select exactly 1.1.2 (8). Reinspect the distribution-signed bundle before submission.
+Xcode Organizer successfully uploaded Durepo 1.1.2 (8) on 2026-09-21 at 12:21 JST. App Store Connect independently shows that upload as Processing. Wait for processing and select exactly 1.1.2 (8) for the release draft. The local archive remains development-signed; the distribution-signed package has not been separately inspected. Earlier command-line export failures (`No Accounts` and missing distribution identities) did not establish that the Xcode GUI was signed out; its registered account was visible and the GUI upload succeeded without account or manual certificate changes.
 
-Evidence: `build/release-1.1.2/archive.log`, `export.log`, archive signature, live draft Build section. Requirements: [Guideline 2.1](https://developer.apple.com/app-store/review/guidelines/#app-completeness); workflow: [Upload builds](https://developer.apple.com/help/app-store-connect/manage-builds/upload-builds/).
+Evidence: `build/release-1.1.2/archive.log`, `export.log`, archive signature, Xcode Organizer upload completion, live TestFlight upload row. Requirements: [Guideline 2.1](https://developer.apple.com/app-store/review/guidelines/#app-completeness); workflow: [Upload builds](https://developer.apple.com/help/app-store-connect/manage-builds/upload-builds/).
 
 ### W1 — WARNING: Store screenshots still show the previous interface
 
