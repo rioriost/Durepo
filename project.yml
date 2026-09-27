@@ -6,6 +6,8 @@ options:
   createIntermediateGroups: true
 settings:
   base:
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: NO
     DEVELOPMENT_TEAM: 23889H77KX
     SWIFT_VERSION: "6.0"
     MACOSX_DEPLOYMENT_TARGET: "26.0"

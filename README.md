@@ -25,20 +25,22 @@ See [the reviewed implementation plan](docs/plan.md), [the multi-angle review](d
 ## Requirements
 
 - macOS 26 Tahoe or later
-- Apple Silicon
+- Apple Silicon (arm64 / AArch64 only)
 - Xcode 26
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 
 ## Build and test
 
 ```sh
-swift test --parallel
-swift run durepo-smoke
+swift test --arch arm64 --parallel
+swift run --arch arm64 durepo-smoke
 xcodegen generate
 xcodebuild -project Durepo.xcodeproj -scheme Durepo \
   -configuration Debug -derivedDataPath build/DerivedData \
   CODE_SIGNING_ALLOWED=NO build
 ```
+
+All Xcode targets use arm64 only in Debug and Release, including archives; Intel (x86_64) builds are not supported.
 
 To exercise security-scoped bookmarks and `SMAppService`, select team `23889H77KX`, register the App Group `23889H77KX.st.rio.Durepo` in the Apple Developer portal, build with automatic signing, move the built app into `/Applications`, then enable the agent from Durepo. macOS may require approval in System Settings > General > Login Items.
 
